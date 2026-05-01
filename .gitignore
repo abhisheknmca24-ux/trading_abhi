@@ -1,4 +1,10 @@
+# Secrets
 .env
-.venv/
-__pycache__/
 config_local.py
+
+# Python
+__pycache__/
+*.pyc
+
+# Virtual environment
+.venv/
