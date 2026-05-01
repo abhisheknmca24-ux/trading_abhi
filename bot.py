@@ -9,28 +9,32 @@ from ta.momentum import RSIIndicator
 from ta.volatility import AverageTrueRange
 
 # ==============================
-# ENV (Railway)
+# CONFIG SWITCH
 # ==============================
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
-TD_API_KEY = os.getenv("TD_API_KEY")
+USE_LOCAL = os.getenv("USE_LOCAL", "false").lower() == "true"
 
-if not TD_API_KEY:
-    raise ValueError("❌ TD_API_KEY missing")
+if USE_LOCAL:
+    from config_local import BOT_TOKEN, CHAT_ID, TD_API_KEY
+else:
+    from config_prod import BOT_TOKEN, CHAT_ID, TD_API_KEY
 
 # ==============================
 # CONFIG
 # ==============================
-PAIRS = ["EUR/USD", "GBP/USD", "USD/JPY"]
-SLEEP_TIME = 60
-COOLDOWN = 300
-
+PAIR = "EUR/USD"
+SLEEP_TIME = 600  # 10 minutes
+API_LIMIT_SLEEP = 3600  # 1 hour
 STATS_FILE = "trade_stats.json"
+api_blocked_until = 0
 
 # ==============================
-# TELEGRAM SAFE
+# TELEGRAM
 # ==============================
 def send_telegram(msg):
+    if not BOT_TOKEN or not CHAT_ID:
+        print("Telegram config missing")
+        return
+
     try:
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
         requests.post(url, data={"chat_id": CHAT_ID, "text": msg}, timeout=10)
@@ -41,21 +45,32 @@ def send_telegram(msg):
 # TIME
 # ==============================
 def get_ist():
-    return pd.Timestamp.utcnow() + pd.Timedelta(hours=5, minutes=30)
+    return pd.Timestamp.now(tz="UTC") + pd.Timedelta(hours=5, minutes=30)
+
+def is_trading_time():
+    now = get_ist()
+    return 12 <= now.hour <= 21  # 12:00–21:59 IST
 
 # ==============================
-# DATA (DUAL FORMAT)
+# DATA (SAFE)
 # ==============================
 def get_data(pair, interval):
-    formats = [pair, pair.replace("/", "")]
+    global api_blocked_until
 
-    for symbol in formats:
+    if time.time() < api_blocked_until:
+        wait_minutes = round((api_blocked_until - time.time()) / 60)
+        print(f"API limit cooldown active. Trying again in {wait_minutes} minutes.")
+        return None
+
+    symbols = [pair, pair.replace("/", "")]
+
+    for sym in symbols:
         try:
-            time.sleep(1)
+            time.sleep(1.5)
 
             url = "https://api.twelvedata.com/time_series"
             params = {
-                "symbol": symbol,
+                "symbol": sym,
                 "interval": interval,
                 "outputsize": 100,
                 "apikey": TD_API_KEY
@@ -64,6 +79,11 @@ def get_data(pair, interval):
             res = requests.get(url, params=params).json()
 
             if "values" not in res:
+                print("API ERROR:", res)
+                if res.get("code") == 429:
+                    api_blocked_until = time.time() + API_LIMIT_SLEEP
+                    print("Daily API credits exhausted. Pausing API requests for 1 hour.")
+                    return None
                 continue
 
             df = pd.DataFrame(res["values"]).iloc[::-1]
@@ -84,7 +104,7 @@ def get_data(pair, interval):
         except:
             continue
 
-    print(f"❌ Data failed: {pair}")
+    print("❌ Data fetch failed")
     return None
 
 # ==============================
@@ -92,12 +112,10 @@ def get_data(pair, interval):
 # ==============================
 def add_indicators(df):
     df = df.copy()
-
     df["EMA50"] = EMAIndicator(df["Close"], 50).ema_indicator()
     df["EMA200"] = EMAIndicator(df["Close"], 200).ema_indicator()
     df["RSI"] = RSIIndicator(df["Close"], 14).rsi()
     df["ATR"] = AverageTrueRange(df["High"], df["Low"], df["Close"], 14).average_true_range()
-
     return df
 
 # ==============================
@@ -108,41 +126,22 @@ def load_stats():
         return {"wins": 0, "losses": 0}
     return json.load(open(STATS_FILE))
 
-def save_stats(stats):
-    json.dump(stats, open(STATS_FILE, "w"))
+def save_stats(s):
+    json.dump(s, open(STATS_FILE, "w"))
 
 def update_stats(result):
-    stats = load_stats()
+    s = load_stats()
     if result == "WIN":
-        stats["wins"] += 1
+        s["wins"] += 1
     else:
-        stats["losses"] += 1
-    save_stats(stats)
-    return stats
+        s["losses"] += 1
+    save_stats(s)
+    return s
 
 def accuracy():
     s = load_stats()
     total = s["wins"] + s["losses"]
-    return 0 if total == 0 else round((s["wins"] / total) * 100, 2)
-
-# ==============================
-# FILTER
-# ==============================
-def adaptive_filter(df):
-    last = df.iloc[-1]
-    score = 0
-
-    if 40 < last["RSI"] < 65:
-        score += 30
-
-    trend = abs(last["EMA50"] - last["EMA200"])
-    if trend > 0.0005:
-        score += 30
-
-    if last["ATR"] > df["ATR"].mean():
-        score += 40
-
-    return score >= 70
+    return 0 if total == 0 else round((s["wins"]/total)*100, 2)
 
 # ==============================
 # SIGNAL LOGIC
@@ -162,36 +161,34 @@ def generate(df1, df5):
     if up:
         signal = "BUY"
         confidence += 30
-        reasons.append("MTF Uptrend")
+        reasons.append("Uptrend")
 
         if last["RSI"] > prev["RSI"]:
             confidence += 20
-            reasons.append("RSI Momentum")
+            reasons.append("Momentum")
 
         if last["ATR"] > df1["ATR"].mean():
             confidence += 20
-            reasons.append("High Volatility")
+            reasons.append("Volatility")
 
     elif down:
         signal = "SELL"
         confidence += 30
-        reasons.append("MTF Downtrend")
+        reasons.append("Downtrend")
 
         if last["RSI"] < prev["RSI"]:
             confidence += 20
-            reasons.append("RSI Momentum")
+            reasons.append("Momentum")
 
         if last["ATR"] > df1["ATR"].mean():
             confidence += 20
-            reasons.append("High Volatility")
+            reasons.append("Volatility")
 
     grade = None
     if confidence >= 85:
         grade = "S-TIER"
     elif confidence >= 75:
         grade = "A+"
-    elif confidence >= 65:
-        grade = "A"
 
     return signal, confidence, grade, reasons
 
@@ -214,64 +211,62 @@ def check_result(pair, signal, entry_price):
 # MAIN BOT
 # ==============================
 def run():
-    print("🚀 PRO BOT RUNNING")
-    send_telegram("🚀 Trading Bot Started")
-
-    last_trade = 0
+    print("🚀 FINAL BOT RUNNING")
+    send_telegram("🚀 Bot Started (10min Strategy Active)")
 
     while True:
         try:
-            if time.time() - last_trade < COOLDOWN:
-                time.sleep(5)
+            if time.time() < api_blocked_until:
+                print("API cooldown active")
+                time.sleep(300)
                 continue
 
-            best = None
-            best_conf = 0
+            if not is_trading_time():
+                print("⏸ Market closed")
+                time.sleep(600)
+                continue
 
-            for pair in PAIRS:
-                df1_raw = get_data(pair, "1min")
-                df5_raw = get_data(pair, "5min")
+            df1_raw = get_data(PAIR, "1min")
+            if df1_raw is None:
+                time.sleep(SLEEP_TIME)
+                continue
 
-                if df1_raw is None or df5_raw is None:
-                    continue
+            df5_raw = get_data(PAIR, "5min")
+            if df5_raw is None:
+                time.sleep(SLEEP_TIME)
+                continue
 
-                df1 = add_indicators(df1_raw)
-                df5 = add_indicators(df5_raw)
+            df1 = add_indicators(df1_raw)
+            df5 = add_indicators(df5_raw)
 
-                signal, confidence, grade, reasons = generate(df1, df5)
+            signal, confidence, grade, reasons = generate(df1, df5)
 
-                if signal and grade in ["A+", "S-TIER"] and adaptive_filter(df1):
-                    if confidence > best_conf:
-                        best = (pair, signal, confidence, grade, reasons)
-                        best_conf = confidence
-
-            if best:
-                pair, signal, confidence, grade, reasons = best
-
+            if signal and (grade in ["A+", "S-TIER"] or confidence >= 70):
                 now = get_ist()
-                entry_time = (now + pd.Timedelta(minutes=2)).replace(second=0)
+
+                entry_time = now + pd.Timedelta(minutes=1)
+                entry_time = entry_time.floor("min")
                 expiry_time = entry_time + pd.Timedelta(minutes=5)
 
                 direction = "CALL" if signal == "BUY" else "PUT"
-                pair_clean = pair.replace("/", "")
+                pair_clean = "EURUSD"
 
                 send_telegram(f"""
 ⏳ PRE SIGNAL
 
-📊 Pair: {pair_clean}
-📈 Direction: {direction}
+{pair_clean} {direction}
 
-🕒 Entry: {entry_time.strftime('%H:%M')}
-⏳ Expiry: {expiry_time.strftime('%H:%M')}
+Entry: {entry_time.strftime('%H:%M')}
+Expiry: {expiry_time.strftime('%H:%M')}
 
-🏆 Grade: {grade}
-📊 Confidence: {confidence}%
+Grade: {grade}
+Confidence: {confidence}%
 """)
 
                 while get_ist() < entry_time:
                     time.sleep(1)
 
-                entry_df = get_data(pair, "1min")
+                entry_df = get_data(PAIR, "1min")
                 if entry_df is None:
                     continue
 
@@ -280,40 +275,32 @@ def run():
                 send_telegram(f"""
 🚀 ENTER NOW
 
-📊 Pair: {pair_clean}
-📈 Direction: {direction}
+{pair_clean} {direction}
 
-🕒 Entry: {entry_time.strftime('%H:%M')}
-⏳ Expiry: {expiry_time.strftime('%H:%M')}
+Entry: {entry_time.strftime('%H:%M')}
+Expiry: {expiry_time.strftime('%H:%M')}
 
-⏱ Duration: 5 min
+Duration: 5 min
 
-🏆 Grade: {grade}
-📊 Confidence: {confidence}%
-
-📌 Reasons:
-{', '.join(reasons)}
+Reasons: {', '.join(reasons)}
 """)
 
                 time.sleep(300)
 
-                result = check_result(pair, signal, entry_price)
+                result = check_result(PAIR, signal, entry_price)
 
                 if result:
                     stats = update_stats(result)
 
                     send_telegram(f"""
-📊 TRADE RESULT
+📊 RESULT
 
-Result: {result}
+{result}
 
 Wins: {stats['wins']}
 Losses: {stats['losses']}
-
-🎯 Accuracy: {accuracy()}%
+Accuracy: {accuracy()}%
 """)
-
-                last_trade = time.time()
 
             else:
                 print("❌ No signal")
