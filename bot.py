@@ -4,22 +4,19 @@ import json
 import requests
 import pandas as pd
 
-from dotenv import load_dotenv
 from ta.trend import EMAIndicator
 from ta.momentum import RSIIndicator
 from ta.volatility import AverageTrueRange
 
 # ==============================
-# LOAD ENV
+# ENV (Railway)
 # ==============================
-load_dotenv()
-
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 TD_API_KEY = os.getenv("TD_API_KEY")
 
 if not TD_API_KEY:
-    raise ValueError("❌ TD_API_KEY missing in .env")
+    raise ValueError("❌ TD_API_KEY missing")
 
 # ==============================
 # CONFIG
@@ -31,14 +28,12 @@ COOLDOWN = 300
 STATS_FILE = "trade_stats.json"
 
 # ==============================
-# TELEGRAM (SAFE)
+# TELEGRAM SAFE
 # ==============================
 def send_telegram(msg):
     try:
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        r = requests.post(url, data={"chat_id": CHAT_ID, "text": msg}, timeout=10)
-        if r.status_code != 200:
-            print("Telegram failed:", r.text)
+        requests.post(url, data={"chat_id": CHAT_ID, "text": msg}, timeout=10)
     except Exception as e:
         print("Telegram error:", e)
 
@@ -49,7 +44,7 @@ def get_ist():
     return pd.Timestamp.utcnow() + pd.Timedelta(hours=5, minutes=30)
 
 # ==============================
-# DATA (DUAL FORMAT FIX)
+# DATA (DUAL FORMAT)
 # ==============================
 def get_data(pair, interval):
     formats = [pair, pair.replace("/", "")]
@@ -150,7 +145,7 @@ def adaptive_filter(df):
     return score >= 70
 
 # ==============================
-# SIGNAL
+# SIGNAL LOGIC
 # ==============================
 def generate(df1, df5):
     last = df1.iloc[-1]
@@ -266,8 +261,8 @@ def run():
 📊 Pair: {pair_clean}
 📈 Direction: {direction}
 
-🕒 Entry Time: {entry_time.strftime('%H:%M')}
-⏳ Expiry Time: {expiry_time.strftime('%H:%M')}
+🕒 Entry: {entry_time.strftime('%H:%M')}
+⏳ Expiry: {expiry_time.strftime('%H:%M')}
 
 🏆 Grade: {grade}
 📊 Confidence: {confidence}%

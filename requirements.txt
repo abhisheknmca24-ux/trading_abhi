@@ -1,4 +1,4 @@
-yfinance
+python-dotenv
 pandas
-ta
 requests
+ta
