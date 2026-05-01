@@ -9,12 +9,12 @@ if os.getenv("RAILWAY_ENVIRONMENT"):
 else:
     from config_local import BOT_TOKEN, CHAT_ID, TD_API_KEY
 
-from indicators import add_indicators
+from indicators import add_indicators, calculate_score
 from fixed_trade import get_fixed_signal
 from forex_trade import get_forex_signal
 
 PAIR = "EUR/USD"
-SLEEP_TIME = 600  # 10 min
+SLEEP_TIME = 180   # 3 minutes (safe + fast)
 
 
 if not TD_API_KEY:
@@ -97,15 +97,41 @@ def run():
             fixed = get_fixed_signal(df)
 
             if fixed:
+                # scoring
+                confidence, grade = calculate_score(df)
+                print("Score:", confidence, grade)
+
+                send_telegram(f"""
+⚠️ PRE-SIGNAL
+
+📊 EURUSD {fixed['signal']}
+
+🏆 Grade: {grade}
+📊 Confidence: {confidence}%
+
+⏳ Entry: {fixed['entry']} (in {fixed.get('seconds_left', 0)//60} min)
+
+⚠️ Wait for confirmation...
+""")
+
                 forex = get_forex_signal(df, fixed["signal"])
+
+                countdown = fixed.get("seconds_left", 0) // 60
+
+                confirm = fixed
 
                 msg = f"""
 ━━━━━━━━━━━━━━
+✅ CONFIRMED SIGNAL
+
 📊 EURUSD {forex['direction']}
 
+🏆 Grade: {grade}
+📊 Confidence: {confidence}%
+
 ⏳ FIXED TRADE
-Entry: {fixed['entry']}
-Expiry: {fixed['expiry']}
+Entry: {confirm['entry']}
+Expiry: {confirm['expiry']}
 
 📈 FOREX TRADE
 Entry: {forex['entry']}

@@ -14,11 +14,23 @@ def get_fixed_signal(df):
         return None
 
     now = pd.Timestamp.now()
-    entry = (now + pd.Timedelta(minutes=1)).floor("min")
+
+    # ⏱ Round to next minute
+    next_minute = now.ceil("min")
+
+    # 🎯 Entry = 2 minutes ahead (perfect buffer)
+    entry = next_minute + pd.Timedelta(minutes=2)
+
+    # ⏳ Expiry = 5 minutes
     expiry = entry + pd.Timedelta(minutes=5)
+
+    # 🚫 Prevent late signals
+    if (entry - now).total_seconds() < 90:
+        return None
 
     return {
         "signal": signal,
         "entry": entry.strftime("%H:%M"),
-        "expiry": expiry.strftime("%H:%M")
+        "expiry": expiry.strftime("%H:%M"),
+        "seconds_left": int((entry - now).total_seconds())
     }
