@@ -1,13 +1,15 @@
 import requests
 import time
 import pandas as pd
+import os
 
-USE_LOCAL = True
-
-if USE_LOCAL:
-    from config_local import BOT_TOKEN, CHAT_ID, TD_API_KEY
-else:
+# Auto detect environment
+if os.getenv("RAILWAY_ENVIRONMENT") or os.getenv("BOT_TOKEN"):
+    # Running in Railway / production
     from config_prod import BOT_TOKEN, CHAT_ID, TD_API_KEY
+else:
+    # Running locally
+    from config_local import BOT_TOKEN, CHAT_ID, TD_API_KEY
 
 from indicators import add_indicators
 from fixed_trade import get_fixed_signal
