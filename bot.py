@@ -1,51 +1,96 @@
 import os
 import time
+import json
 import requests
 import pandas as pd
-import yfinance as yf
 
+from dotenv import load_dotenv
 from ta.trend import EMAIndicator
 from ta.momentum import RSIIndicator
-from ta.volatility import BollingerBands, AverageTrueRange
+from ta.volatility import AverageTrueRange
 
 # ==============================
-# ENV
+# LOAD ENV
 # ==============================
+load_dotenv()
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
+TD_API_KEY = os.getenv("TD_API_KEY")
 
-PAIRS = {
-    "EUR/USD": "EURUSD=X",
-    "GBP/USD": "GBPUSD=X",
-    "USD/JPY": "USDJPY=X"
-}
+if not TD_API_KEY:
+    raise ValueError("❌ TD_API_KEY missing in .env")
 
+# ==============================
+# CONFIG
+# ==============================
+PAIRS = ["EUR/USD", "GBP/USD", "USD/JPY"]
 SLEEP_TIME = 60
 COOLDOWN = 300
 
+STATS_FILE = "trade_stats.json"
+
 # ==============================
-# TELEGRAM
+# TELEGRAM (SAFE)
 # ==============================
-def send_telegram(message):
+def send_telegram(msg):
     try:
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        requests.post(url, data={"chat_id": CHAT_ID, "text": message})
+        r = requests.post(url, data={"chat_id": CHAT_ID, "text": msg}, timeout=10)
+        if r.status_code != 200:
+            print("Telegram failed:", r.text)
     except Exception as e:
-        print("Telegram Error:", e)
+        print("Telegram error:", e)
 
 # ==============================
-# DATA FIX
+# TIME
 # ==============================
-def get_data(symbol, interval):
-    df = yf.download(symbol, interval=interval, period="1d")
+def get_ist():
+    return pd.Timestamp.utcnow() + pd.Timedelta(hours=5, minutes=30)
 
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
+# ==============================
+# DATA (DUAL FORMAT FIX)
+# ==============================
+def get_data(pair, interval):
+    formats = [pair, pair.replace("/", "")]
 
-    df = df.apply(lambda x: x.squeeze())
-    df.dropna(inplace=True)
+    for symbol in formats:
+        try:
+            time.sleep(1)
 
-    return df
+            url = "https://api.twelvedata.com/time_series"
+            params = {
+                "symbol": symbol,
+                "interval": interval,
+                "outputsize": 100,
+                "apikey": TD_API_KEY
+            }
+
+            res = requests.get(url, params=params).json()
+
+            if "values" not in res:
+                continue
+
+            df = pd.DataFrame(res["values"]).iloc[::-1]
+
+            df["Open"] = pd.to_numeric(df["open"])
+            df["High"] = pd.to_numeric(df["high"])
+            df["Low"] = pd.to_numeric(df["low"])
+            df["Close"] = pd.to_numeric(df["close"])
+
+            df = df[["Open", "High", "Low", "Close"]]
+            df.dropna(inplace=True)
+
+            if len(df) < 30:
+                continue
+
+            return df
+
+        except:
+            continue
+
+    print(f"❌ Data failed: {pair}")
+    return None
 
 # ==============================
 # INDICATORS
@@ -53,183 +98,230 @@ def get_data(symbol, interval):
 def add_indicators(df):
     df = df.copy()
 
-    df['Close'] = pd.to_numeric(df['Close'], errors='coerce')
-    df['High'] = pd.to_numeric(df['High'], errors='coerce')
-    df['Low'] = pd.to_numeric(df['Low'], errors='coerce')
-
-    df['EMA50'] = EMAIndicator(df['Close'], 50).ema_indicator()
-    df['EMA200'] = EMAIndicator(df['Close'], 200).ema_indicator()
-    df['RSI'] = RSIIndicator(df['Close'], 14).rsi()
-
-    bb = BollingerBands(df['Close'], 20, 2)
-    df['BB_H'] = bb.bollinger_hband()
-    df['BB_L'] = bb.bollinger_lband()
-
-    df['ATR'] = AverageTrueRange(
-        df['High'], df['Low'], df['Close'], 14
-    ).average_true_range()
+    df["EMA50"] = EMAIndicator(df["Close"], 50).ema_indicator()
+    df["EMA200"] = EMAIndicator(df["Close"], 200).ema_indicator()
+    df["RSI"] = RSIIndicator(df["Close"], 14).rsi()
+    df["ATR"] = AverageTrueRange(df["High"], df["Low"], df["Close"], 14).average_true_range()
 
     return df
 
 # ==============================
-# FILTERS
+# STATS
 # ==============================
-def is_active_market():
-    hour = pd.Timestamp.utcnow().hour
-    return 6 <= hour <= 18
+def load_stats():
+    if not os.path.exists(STATS_FILE):
+        return {"wins": 0, "losses": 0}
+    return json.load(open(STATS_FILE))
 
-def is_fake_breakout(df):
-    last = df.iloc[-1]
-    body = abs(last['Close'] - last['Open'])
-    wick = last['High'] - max(last['Close'], last['Open'])
-    return wick > body * 2
+def save_stats(stats):
+    json.dump(stats, open(STATS_FILE, "w"))
 
-def strong_candle(df):
+def update_stats(result):
+    stats = load_stats()
+    if result == "WIN":
+        stats["wins"] += 1
+    else:
+        stats["losses"] += 1
+    save_stats(stats)
+    return stats
+
+def accuracy():
+    s = load_stats()
+    total = s["wins"] + s["losses"]
+    return 0 if total == 0 else round((s["wins"] / total) * 100, 2)
+
+# ==============================
+# FILTER
+# ==============================
+def adaptive_filter(df):
     last = df.iloc[-1]
-    body = abs(last['Close'] - last['Open'])
-    range_ = last['High'] - last['Low']
-    return body > (range_ * 0.6)
+    score = 0
+
+    if 40 < last["RSI"] < 65:
+        score += 30
+
+    trend = abs(last["EMA50"] - last["EMA200"])
+    if trend > 0.0005:
+        score += 30
+
+    if last["ATR"] > df["ATR"].mean():
+        score += 40
+
+    return score >= 70
 
 # ==============================
 # SIGNAL
 # ==============================
-def generate_signal(df_m1, df_m5):
+def generate(df1, df5):
+    last = df1.iloc[-1]
+    prev = df1.iloc[-2]
+    m5 = df5.iloc[-1]
 
-    last = df_m1.iloc[-1]
-    prev = df_m1.iloc[-2]
-    m5_last = df_m5.iloc[-1]
-
-    signal = None
     confidence = 0
     reasons = []
+    signal = None
 
-    uptrend = last['EMA50'] > last['EMA200'] and m5_last['EMA50'] > m5_last['EMA200']
-    downtrend = last['EMA50'] < last['EMA200'] and m5_last['EMA50'] < m5_last['EMA200']
+    up = last["EMA50"] > last["EMA200"] and m5["EMA50"] > m5["EMA200"]
+    down = last["EMA50"] < last["EMA200"] and m5["EMA50"] < m5["EMA200"]
 
-    if uptrend:
-        if (
-            last['Close'] > last['EMA50'] and
-            last['RSI'] > prev['RSI'] and
-            last['RSI'] < 70 and
-            strong_candle(df_m1)
-        ):
-            signal = "BUY"
-            confidence += 30
-            reasons.append("MTF Uptrend")
+    if up:
+        signal = "BUY"
+        confidence += 30
+        reasons.append("MTF Uptrend")
 
-            if last['Close'] > prev['High']:
-                confidence += 20
-                reasons.append("Breakout")
+        if last["RSI"] > prev["RSI"]:
+            confidence += 20
+            reasons.append("RSI Momentum")
 
-            if last['ATR'] > df_m1['ATR'].mean():
-                confidence += 15
-                reasons.append("Volatility")
+        if last["ATR"] > df1["ATR"].mean():
+            confidence += 20
+            reasons.append("High Volatility")
 
-            if not is_fake_breakout(df_m1):
-                confidence += 20
-                reasons.append("Valid Break")
+    elif down:
+        signal = "SELL"
+        confidence += 30
+        reasons.append("MTF Downtrend")
 
-            if is_active_market():
-                confidence += 15
-                reasons.append("Active Session")
+        if last["RSI"] < prev["RSI"]:
+            confidence += 20
+            reasons.append("RSI Momentum")
 
-    if downtrend:
-        if (
-            last['Close'] < last['EMA50'] and
-            last['RSI'] < prev['RSI'] and
-            last['RSI'] > 30 and
-            strong_candle(df_m1)
-        ):
-            signal = "SELL"
-            confidence += 30
-            reasons.append("MTF Downtrend")
-
-            if last['Close'] < prev['Low']:
-                confidence += 20
-                reasons.append("Breakdown")
-
-            if last['ATR'] > df_m1['ATR'].mean():
-                confidence += 15
-                reasons.append("Volatility")
-
-            if not is_fake_breakout(df_m1):
-                confidence += 20
-                reasons.append("Valid Break")
-
-            if is_active_market():
-                confidence += 15
-                reasons.append("Active Session")
+        if last["ATR"] > df1["ATR"].mean():
+            confidence += 20
+            reasons.append("High Volatility")
 
     grade = None
-    if confidence >= 90:
+    if confidence >= 85:
         grade = "S-TIER"
-    elif confidence >= 80:
+    elif confidence >= 75:
         grade = "A+"
-    elif confidence >= 70:
+    elif confidence >= 65:
         grade = "A"
 
     return signal, confidence, grade, reasons
 
 # ==============================
-# FORMAT
+# RESULT CHECK
 # ==============================
-def format_message(pair, signal, confidence, grade, reasons, price):
-    return f"""
-🚀 PRO SIGNAL (5 MIN TRADE)
+def check_result(pair, signal, entry_price):
+    df = get_data(pair, "1min")
+    if df is None:
+        return None
 
-📊 Pair: {pair}
-🔥 Signal: {signal}
-🏆 Grade: {grade}
-📈 Confidence: {confidence}%
+    close = df.iloc[-1]["Close"]
 
-💰 Entry: {price:.5f}
-⏳ Expiry: 5 Minutes
-
-📌 Reasons:
-{', '.join(reasons)}
-"""
+    if signal == "BUY":
+        return "WIN" if close > entry_price else "LOSS"
+    else:
+        return "WIN" if close < entry_price else "LOSS"
 
 # ==============================
-# MAIN
+# MAIN BOT
 # ==============================
-def run_bot():
-    print("🔥 MULTI-PAIR PRO BOT RUNNING...")
+def run():
+    print("🚀 PRO BOT RUNNING")
+    send_telegram("🚀 Trading Bot Started")
 
-    send_telegram("✅ Multi-Pair Bot Started 🚀")
-
-    last_trade_time = 0
+    last_trade = 0
 
     while True:
         try:
-            now = time.time()
-
-            if now - last_trade_time < COOLDOWN:
+            if time.time() - last_trade < COOLDOWN:
                 time.sleep(5)
                 continue
 
-            best_signal = None
+            best = None
             best_conf = 0
 
-            for pair_name, symbol in PAIRS.items():
+            for pair in PAIRS:
+                df1_raw = get_data(pair, "1min")
+                df5_raw = get_data(pair, "5min")
 
-                df_m1 = add_indicators(get_data(symbol, "1m"))
-                df_m5 = add_indicators(get_data(symbol, "5m"))
+                if df1_raw is None or df5_raw is None:
+                    continue
 
-                signal, confidence, grade, reasons = generate_signal(df_m1, df_m5)
+                df1 = add_indicators(df1_raw)
+                df5 = add_indicators(df5_raw)
 
-                if signal and grade in ["A+", "S-TIER"]:
+                signal, confidence, grade, reasons = generate(df1, df5)
+
+                if signal and grade in ["A+", "S-TIER"] and adaptive_filter(df1):
                     if confidence > best_conf:
+                        best = (pair, signal, confidence, grade, reasons)
                         best_conf = confidence
-                        best_signal = (pair_name, signal, confidence, grade, reasons, df_m1.iloc[-1]['Close'])
 
-            if best_signal:
-                msg = format_message(*best_signal)
-                send_telegram(msg)
+            if best:
+                pair, signal, confidence, grade, reasons = best
 
-                print("✅ BEST SIGNAL SENT")
-                last_trade_time = time.time()
+                now = get_ist()
+                entry_time = (now + pd.Timedelta(minutes=2)).replace(second=0)
+                expiry_time = entry_time + pd.Timedelta(minutes=5)
+
+                direction = "CALL" if signal == "BUY" else "PUT"
+                pair_clean = pair.replace("/", "")
+
+                send_telegram(f"""
+⏳ PRE SIGNAL
+
+📊 Pair: {pair_clean}
+📈 Direction: {direction}
+
+🕒 Entry Time: {entry_time.strftime('%H:%M')}
+⏳ Expiry Time: {expiry_time.strftime('%H:%M')}
+
+🏆 Grade: {grade}
+📊 Confidence: {confidence}%
+""")
+
+                while get_ist() < entry_time:
+                    time.sleep(1)
+
+                entry_df = get_data(pair, "1min")
+                if entry_df is None:
+                    continue
+
+                entry_price = entry_df.iloc[-1]["Close"]
+
+                send_telegram(f"""
+🚀 ENTER NOW
+
+📊 Pair: {pair_clean}
+📈 Direction: {direction}
+
+🕒 Entry: {entry_time.strftime('%H:%M')}
+⏳ Expiry: {expiry_time.strftime('%H:%M')}
+
+⏱ Duration: 5 min
+
+🏆 Grade: {grade}
+📊 Confidence: {confidence}%
+
+📌 Reasons:
+{', '.join(reasons)}
+""")
+
+                time.sleep(300)
+
+                result = check_result(pair, signal, entry_price)
+
+                if result:
+                    stats = update_stats(result)
+
+                    send_telegram(f"""
+📊 TRADE RESULT
+
+Result: {result}
+
+Wins: {stats['wins']}
+Losses: {stats['losses']}
+
+🎯 Accuracy: {accuracy()}%
+""")
+
+                last_trade = time.time()
+
             else:
-                print("❌ No strong signals across pairs")
+                print("❌ No signal")
 
             time.sleep(SLEEP_TIME)
 
@@ -241,4 +333,4 @@ def run_bot():
 # START
 # ==============================
 if __name__ == "__main__":
-    run_bot()
+    run()
