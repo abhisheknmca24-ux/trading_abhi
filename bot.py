@@ -3,12 +3,10 @@ import time
 import pandas as pd
 import os
 
-# Auto detect environment
-if os.getenv("RAILWAY_ENVIRONMENT") or os.getenv("BOT_TOKEN"):
-    # Running in Railway / production
+# ONLY detect Railway (not BOT_TOKEN)
+if os.getenv("RAILWAY_ENVIRONMENT"):
     from config_prod import BOT_TOKEN, CHAT_ID, TD_API_KEY
 else:
-    # Running locally
     from config_local import BOT_TOKEN, CHAT_ID, TD_API_KEY
 
 from indicators import add_indicators
@@ -29,7 +27,12 @@ if not TD_API_KEY:
 def send_telegram(msg):
     try:
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        requests.post(url, data={"chat_id": CHAT_ID, "text": msg})
+        res = requests.post(url, data={
+            "chat_id": CHAT_ID,
+            "text": msg
+        })
+        print("Telegram:", res.text)
+
     except Exception as e:
         print("Telegram error:", e)
 
@@ -51,6 +54,13 @@ def get_data(interval):
 
     if "values" not in res:
         print("API ERROR:", res)
+
+        if res.get("code") == 429:
+            send_telegram("🚨 API LIMIT HIT — Bot paused for 1 hour")
+            time.sleep(3600)
+            return None
+
+        send_telegram(f"⚠️ API Error: {res}")
         return None
 
     df = pd.DataFrame(res["values"])
@@ -72,6 +82,7 @@ def get_data(interval):
 # ==============================
 def run():
     print("🚀 BOT RUNNING")
+    send_telegram("🚀 Bot Started Successfully")
 
     while True:
         try:
