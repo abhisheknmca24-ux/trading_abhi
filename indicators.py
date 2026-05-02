@@ -9,6 +9,7 @@ def add_indicators(df):
     df["EMA200"] = EMAIndicator(df["Close"], 200).ema_indicator()
     df["RSI"] = RSIIndicator(df["Close"], 14).rsi()
     df["ATR"] = AverageTrueRange(df["High"], df["Low"], df["Close"], 14).average_true_range()
+    df["TrendStrength"] = (df["EMA50"] - df["EMA200"]).abs()
     return df
 
 
@@ -20,7 +21,7 @@ def calculate_score(df):
 
     atr = last["ATR"]
     atr_mean = df["ATR"].mean()
-    trend_strength = abs(last["EMA50"] - last["EMA200"])
+    trend_strength = last["TrendStrength"]
 
     if pd.isna(atr):
         atr = 0

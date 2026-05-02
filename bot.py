@@ -18,6 +18,7 @@ from indicators import add_indicators, calculate_score
 PAIR = "EUR/USD"
 SLEEP_TIME = 120   # 2 minutes
 NEWS_BLOCK_MINUTES = 15
+TRADE_COOLDOWN_MINUTES = 20
 HIGH_IMPACT_NEWS_EVENTS = [
     # Add high-impact event times in Asia/Kolkata timezone.
     # Example: "2026-05-03 18:00"
@@ -164,6 +165,7 @@ def run():
 
     mode = "normal"
     last_signal_time = None
+    last_trade_time = None
     cached_interval = None
     cached_candle_key = None
     cached_df = None
@@ -216,9 +218,25 @@ def run():
             if confidence >= 80:
                 mode = "fast"
 
+            if confidence < 85:
+                print(f"Signal rejected - confidence too low: {confidence}%")
+                time.sleep(sleep_time)
+                continue
+
             fixed = get_fixed_signal(df)
 
             if fixed:
+                now = pd.Timestamp.now(tz="Asia/Kolkata")
+
+                if last_trade_time is not None:
+                    cooldown_minutes = (now - last_trade_time).total_seconds() / 60
+
+                    if cooldown_minutes < TRADE_COOLDOWN_MINUTES:
+                        remaining = TRADE_COOLDOWN_MINUTES - cooldown_minutes
+                        print(f"Trade cooldown active - {remaining:.1f} min remaining")
+                        time.sleep(sleep_time)
+                        continue
+
                 news_blocked, news_time = is_high_impact_news_window()
 
                 if news_blocked:
@@ -285,6 +303,7 @@ Auto Close: {forex['auto_close']}
                 print(msg)
                 send_telegram(msg)
                 last_signal_time = current_candle_time
+                last_trade_time = pd.Timestamp.now(tz="Asia/Kolkata")
                 mode = "normal"
 
             else:
