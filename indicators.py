@@ -13,14 +13,11 @@ def add_indicators(df):
 
 
 def calculate_score(df):
-    if df is None or len(df) < 2:
-        return 0, "B"
-
     last = df.iloc[-1]
 
     score = 0
 
-    # Trend strength
+    # Trend (EMA)
     if last["EMA50"] > last["EMA200"]:
         score += 25
     elif last["EMA50"] < last["EMA200"]:
@@ -40,7 +37,7 @@ def calculate_score(df):
 
     confidence = score
 
-    # 🎯 GRADING
+    # 🎯 Grade
     if confidence >= 85:
         grade = "S-TIER 🔥"
     elif confidence >= 75:

@@ -14,11 +14,28 @@ from fixed_trade import get_fixed_signal
 from forex_trade import get_forex_signal
 
 PAIR = "EUR/USD"
-SLEEP_TIME = 180   # 3 minutes (safe + fast)
+SLEEP_TIME = 120   # 2 minutes
 
 
 if not TD_API_KEY:
     raise ValueError("TD_API_KEY is missing or empty")
+
+
+def is_market_open():
+    now = pd.Timestamp.now(tz="Asia/Kolkata")
+
+    start = now.replace(hour=13, minute=30, second=0)
+    end = now.replace(hour=21, minute=30, second=0)
+
+    if now.weekday() >= 5:
+        return False
+
+    return start <= now <= end
+
+
+def is_near_candle_close():
+    now = pd.Timestamp.now(tz="Asia/Kolkata")
+    return now.second >= 40
 
 
 # ==============================
@@ -82,23 +99,36 @@ def get_data(interval):
 # ==============================
 def run():
     print("🚀 BOT RUNNING")
-    send_telegram("🚀 Bot Started Successfully")
+    send_telegram("🚀 Bot Started — Smart Mode Active")
 
     while True:
         try:
+            if not is_market_open():
+                print("⏸ Market closed")
+                time.sleep(600)
+                continue
+
+            if is_near_candle_close():
+                sleep_time = 10   # fast mode
+            else:
+                sleep_time = 120  # normal mode
+
+            if not is_near_candle_close():
+                time.sleep(20)
+                continue
+
             df = get_data("1min")
 
             if df is None:
-                time.sleep(SLEEP_TIME)
+                time.sleep(sleep_time)
                 continue
 
             df = add_indicators(df)
+            confidence, grade = calculate_score(df)
 
             fixed = get_fixed_signal(df)
 
             if fixed:
-                # scoring
-                confidence, grade = calculate_score(df)
                 print("Score:", confidence, grade)
 
                 send_telegram(f"""
@@ -109,14 +139,12 @@ def run():
 🏆 Grade: {grade}
 📊 Confidence: {confidence}%
 
-⏳ Entry: {fixed['entry']} (in {fixed.get('seconds_left', 0)//60} min)
+⏳ Entry: {fixed['entry']} (in {fixed['seconds_left']//60} min)
 
 ⚠️ Wait for confirmation...
 """)
 
                 forex = get_forex_signal(df, fixed["signal"])
-
-                countdown = fixed.get("seconds_left", 0) // 60
 
                 confirm = fixed
 
@@ -152,7 +180,7 @@ Hold: {forex['hold']}
             else:
                 print("❌ No signal")
 
-            time.sleep(SLEEP_TIME)
+            time.sleep(sleep_time)
 
         except Exception as e:
             print("Error:", e)
