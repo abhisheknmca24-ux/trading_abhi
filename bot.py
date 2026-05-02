@@ -17,6 +17,9 @@ from indicators import add_indicators, calculate_score
 
 PAIR = "EUR/USD"
 SLEEP_TIME = 120   # 2 minutes
+IDLE_SLEEP_TIME = 900   # 15 minutes during weekends/off-market hours
+MARKET_OPEN_TIME = clock_time(13, 30)
+MARKET_CLOSE_TIME = clock_time(21, 30)
 NEWS_BLOCK_MINUTES = 15
 TRADE_COOLDOWN_MINUTES = 20
 HIGH_IMPACT_NEWS_EVENTS = [
@@ -30,31 +33,51 @@ if not TD_API_KEY:
 
 
 def is_market_open():
-    now = pd.Timestamp.now(tz="Asia/Kolkata")
-
-    if now.weekday() >= 5:
-        return False
-
-    current_time = now.time()
-
-    if current_time < clock_time(13, 30) or current_time > clock_time(21, 30):
-        return False
-
-    return True
+    market_open, _ = get_market_status()
+    return market_open
 
 
-def get_market_status():
-    now = pd.Timestamp.now(tz="Asia/Kolkata")
+def get_market_status(now=None):
+    if now is None:
+        now = pd.Timestamp.now(tz="Asia/Kolkata")
 
     if now.weekday() >= 5:
         return False, "weekend"
 
     current_time = now.time()
 
-    if current_time < clock_time(13, 30) or current_time > clock_time(21, 30):
+    if current_time < MARKET_OPEN_TIME or current_time > MARKET_CLOSE_TIME:
         return False, "closed"
 
     return True, "open"
+
+
+def get_next_market_open(now=None):
+    if now is None:
+        now = pd.Timestamp.now(tz="Asia/Kolkata")
+
+    candidate = now.normalize() + pd.Timedelta(
+        hours=MARKET_OPEN_TIME.hour,
+        minutes=MARKET_OPEN_TIME.minute
+    )
+
+    if now.weekday() < 5 and now < candidate:
+        return candidate
+
+    candidate += pd.Timedelta(days=1)
+
+    while candidate.weekday() >= 5:
+        candidate += pd.Timedelta(days=1)
+
+    return candidate
+
+
+def get_idle_sleep_seconds(now=None):
+    if now is None:
+        now = pd.Timestamp.now(tz="Asia/Kolkata")
+
+    seconds_until_open = (get_next_market_open(now) - now).total_seconds()
+    return max(1, int(min(IDLE_SLEEP_TIME, seconds_until_open)))
 
 
 def is_near_candle_close():
@@ -172,14 +195,12 @@ def run():
 
     while True:
         try:
-            market_open, market_status = get_market_status()
+            market_open, _ = get_market_status()
 
             if not market_open:
-                if market_status == "weekend":
-                    print("Weekend — Bot Paused")
-                else:
-                    print("Market Closed — Sleeping")
-                time.sleep(600)
+                print("Market closed — idle mode")
+                print(f"Next market open: {get_next_market_open():%Y-%m-%d %H:%M %Z}")
+                time.sleep(get_idle_sleep_seconds())
                 continue
 
             print("Market Open — Running")
