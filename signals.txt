@@ -1,0 +1,4 @@
+# Format: HH:MM EURUSD CALL|PUT
+# Example:
+# 14:25 EURUSD CALL
+# 15:10 EURUSD PUT

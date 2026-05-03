@@ -14,6 +14,7 @@ else:
 from fixed_trade import get_fixed_signal
 from forex_trade import get_forex_signal
 from indicators import add_indicators, calculate_score
+from signal_list import apply_signal_text, process_signal_list, update_signal_list
 
 PAIR = "EUR/USD"
 SLEEP_TIME = 120   # 2 minutes
@@ -26,6 +27,8 @@ HIGH_IMPACT_NEWS_EVENTS = [
     # Add high-impact event times in Asia/Kolkata timezone.
     # Example: "2026-05-03 18:00"
 ]
+
+LAST_SIGNAL_INPUT_UPDATE_ID = None
 
 
 if not TD_API_KEY:
@@ -134,6 +137,53 @@ def send_telegram(msg):
         print("Telegram error:", e)
 
 
+def fetch_signal_text_from_telegram():
+    global LAST_SIGNAL_INPUT_UPDATE_ID
+
+    try:
+        params = {"timeout": 0}
+        if LAST_SIGNAL_INPUT_UPDATE_ID is not None:
+            params["offset"] = LAST_SIGNAL_INPUT_UPDATE_ID + 1
+
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
+        res = requests.get(url, params=params, timeout=20).json()
+
+        if not res.get("ok"):
+            return None
+
+        updates = res.get("result", [])
+        if not updates:
+            return None
+
+        latest_text = None
+        max_update_id = LAST_SIGNAL_INPUT_UPDATE_ID
+
+        for update in updates:
+            update_id = update.get("update_id")
+            if not isinstance(update_id, int):
+                continue
+
+            if max_update_id is None or update_id > max_update_id:
+                max_update_id = update_id
+
+            message = update.get("message") or update.get("edited_message") or {}
+            chat_id = str(message.get("chat", {}).get("id", ""))
+
+            if chat_id and str(CHAT_ID) != chat_id:
+                continue
+
+            text = (message.get("text") or "").strip()
+            if text:
+                latest_text = text
+
+        LAST_SIGNAL_INPUT_UPDATE_ID = max_update_id
+        return latest_text
+
+    except Exception as e:
+        print("Telegram input error:", e)
+        return None
+
+
 # ==============================
 # DATA FETCH
 # ==============================
@@ -179,6 +229,11 @@ def get_data(interval):
     return df
 
 
+def run_external_signal_engine(df):
+    for signal_message in process_signal_list(df):
+        send_telegram(signal_message)
+
+
 # ==============================
 # MAIN LOOP
 # ==============================
@@ -195,6 +250,14 @@ def run():
 
     while True:
         try:
+            # 1) Update external signal list first.
+            message_text = fetch_signal_text_from_telegram()
+            if message_text:
+                apply_signal_text(message_text)
+            else:
+                update_signal_list()
+
+            # 2) Check market status.
             market_open, _ = get_market_status()
 
             if not market_open:
@@ -229,10 +292,12 @@ def run():
                     cached_candle_key = current_candle_key
                     cached_df = df.copy()
 
+            # 3) Fetch df is complete above.
             if df is None:
                 time.sleep(sleep_time)
                 continue
 
+            # 4) Run auto bot logic.
             df = add_indicators(df)
             confidence, grade = calculate_score(df)
 
@@ -241,6 +306,8 @@ def run():
 
             if confidence < 85:
                 print(f"Signal rejected - confidence too low: {confidence}%")
+                # 5) Run external signal processing after auto bot.
+                run_external_signal_engine(df)
                 time.sleep(sleep_time)
                 continue
 
@@ -255,6 +322,7 @@ def run():
                     if cooldown_minutes < TRADE_COOLDOWN_MINUTES:
                         remaining = TRADE_COOLDOWN_MINUTES - cooldown_minutes
                         print(f"Trade cooldown active - {remaining:.1f} min remaining")
+                        run_external_signal_engine(df)
                         time.sleep(sleep_time)
                         continue
 
@@ -262,6 +330,7 @@ def run():
 
                 if news_blocked:
                     print(f"Trade blocked due to high-impact news at {news_time:%H:%M}")
+                    run_external_signal_engine(df)
                     time.sleep(sleep_time)
                     continue
 
@@ -269,6 +338,7 @@ def run():
 
                 if current_candle_time == last_signal_time:
                     print("Duplicate signal skipped")
+                    run_external_signal_engine(df)
                     time.sleep(sleep_time)
                     continue
 
@@ -330,6 +400,8 @@ Auto Close: {forex['auto_close']}
             else:
                 print("No signal")
 
+            # 5) Process external signal list with the same df.
+            run_external_signal_engine(df)
             time.sleep(sleep_time)
 
         except Exception as e:
