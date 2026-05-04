@@ -94,8 +94,8 @@ def get_current_candle_key(interval):
     if interval == "1min":
         return now.floor("min")
 
-    if interval == "2min":
-        return now.floor("2min")
+    if interval == "5min":
+        return now.floor("5min")
 
     return now.floor("min")
 
@@ -272,7 +272,7 @@ def run():
                 interval = "1min"
                 sleep_time = 10
             else:
-                interval = "2min"
+                interval = "5min"
                 sleep_time = SLEEP_TIME
 
             current_candle_key = get_current_candle_key(interval)
@@ -301,8 +301,10 @@ def run():
             df = add_indicators(df)
             confidence, grade = calculate_score(df)
 
-            if confidence >= 80:
+            if confidence >= 80 and is_near_candle_close():
                 mode = "fast"
+            else:
+                mode = "normal"
 
             if confidence < 85:
                 print(f"Signal rejected - confidence too low: {confidence}%")
