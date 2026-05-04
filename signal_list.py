@@ -18,8 +18,8 @@ except ImportError:  # pragma: no cover
 
 TIMEZONE_NAME = "Asia/Kolkata"
 MARKET_OPEN = time(13, 30)
-SIGNAL_WINDOW_SECONDS = 30
-MARTINGALE_PREALERT_MIN_SECONDS = 30
+SIGNAL_WINDOW_SECONDS = 45
+MARTINGALE_PREALERT_MIN_SECONDS = 45
 MARTINGALE_PREALERT_MAX_SECONDS = 150
 MARTINGALE_ENTRY_DELAY = timedelta(minutes=2)
 SIGNAL_PATTERN = re.compile(r"^(?P<hour>\d{2}):(?P<minute>\d{2})\s+EURUSD\s+(?P<signal>CALL|PUT)$")
@@ -408,7 +408,7 @@ def process_signal_list(df: pd.DataFrame) -> List[str]:
             confidence = calculate_confidence(df, direction)
 
             seconds_to_entry = (signal_time - now).total_seconds()
-            if 30 <= seconds_to_entry <= 150 and not signal.get("pre_sent"):
+            if 45 <= seconds_to_entry <= 150 and not signal.get("pre_sent"):
                 if validate_sniper_signal(df, direction):
                     messages.append(_build_pre_message(signal, confidence))
                     signal["pre_sent"] = True

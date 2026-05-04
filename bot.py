@@ -141,7 +141,7 @@ def fetch_signal_text_from_telegram():
     global LAST_SIGNAL_INPUT_UPDATE_ID
 
     try:
-        params = {"timeout": 0}
+        params = {"timeout": 5}
         if LAST_SIGNAL_INPUT_UPDATE_ID is not None:
             params["offset"] = LAST_SIGNAL_INPUT_UPDATE_ID + 1
 
@@ -270,7 +270,7 @@ def run():
 
             if mode == "fast":
                 interval = "1min"
-                sleep_time = 10
+                sleep_time = 15
             else:
                 interval = "5min"
                 sleep_time = SLEEP_TIME
