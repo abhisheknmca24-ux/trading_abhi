@@ -306,7 +306,7 @@ def run():
             else:
                 mode = "normal"
 
-            if confidence < 85:
+            if confidence < 75:
                 print(f"Signal rejected - confidence too low: {confidence}%")
                 # 5) Run external signal processing after auto bot.
                 run_external_signal_engine(df)
