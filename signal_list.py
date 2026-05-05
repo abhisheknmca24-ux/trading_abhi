@@ -501,8 +501,9 @@ def process_signal_list(
 
             seconds_to_entry = (signal_time - now).total_seconds()
             if PRE_SIGNAL_MIN_SECONDS <= seconds_to_entry <= PRE_SIGNAL_MAX_SECONDS and not signal.get("pre_sent"):
-                messages.append(_build_pre_message(signal, confidence))
-                signal["pre_sent"] = True
+                if confidence >= 60:
+                    messages.append(_build_pre_message(signal, confidence))
+                    signal["pre_sent"] = True
 
             if abs((now - signal_time).total_seconds()) <= SIGNAL_WINDOW_SECONDS:
                 if base_key in processed_signals:
