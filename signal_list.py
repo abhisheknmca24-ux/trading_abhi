@@ -306,33 +306,44 @@ def calculate_confidence(df: pd.DataFrame, direction: str) -> int:
     df = add_indicators(df)
     last = df.iloc[-1]
     prev = df.iloc[-2]
-
-    atr = float(last["ATR"])
+    atr = float(last["ATR"]) if not pd.isna(last.get("ATR")) else 0.0
     atr_mean = float(df["ATR"].mean()) if not pd.isna(df["ATR"].mean()) else 0.0
     candle_size = abs(float(last["Close"]) - float(last["Open"]))
     avg_candle = float((df["Close"] - df["Open"]).abs().tail(10).mean())
     distance = abs(float(last["Close"]) - float(last["EMA50"]))
 
     score = 0
+    # EMA Trend: +25
     if direction == "CALL":
         if last["EMA50"] > last["EMA200"]:
-            score += 30
-        if last["RSI"] > prev["RSI"]:
-            score += 20
+            score += 25
     else:
         if last["EMA50"] < last["EMA200"]:
-            score += 30
+            score += 25
+
+    # RSI Movement: +15
+    if direction == "CALL":
+        if last["RSI"] > prev["RSI"]:
+            score += 15
+    else:
         if last["RSI"] < prev["RSI"]:
-            score += 20
+            score += 15
 
+    # ATR Strength: +15
     if atr > atr_mean:
-        score += 20
-    if candle_size > avg_candle:
-        score += 15
-    if distance <= max(0.0003, atr * 0.50):
         score += 15
 
-    return min(score, 100)
+    # Candle Strength: +10
+    if candle_size > avg_candle:
+        score += 10
+
+    # Distance: +10 (if close to EMA50)
+    if distance <= max(0.0003, atr * 0.50):
+        score += 10
+
+    # Score now maxes at 75 based on weights above; scale to percentage and cap at 95%
+    confidence = int((score / 75) * 100)
+    return min(confidence, 95)
 
 
 def build_forex_targets(df: pd.DataFrame, direction: str, confidence: int) -> tuple[float, float, float]:
@@ -625,7 +636,7 @@ def get_trade_performance() -> dict:
     }
 
 
-def get_adaptive_trade_threshold(base_threshold: int = 75) -> int:
+def get_adaptive_trade_threshold(base_threshold: int = 70) -> int:
     recent_10 = _get_recent_resolved_trades(10)
     if not recent_10:
         return base_threshold
@@ -836,12 +847,21 @@ def process_signal_list(
             if expiry is None:
                 continue
             if expiry <= now:
-                # Use cached 1min data to determine final price
-                if minute_df is None or len(minute_df) < 1:
-                    # cannot determine result without latest 1min data; skip for now
-                    continue
+                # Use cached 1min data to determine final price; fallback to provided `df`.
+                final_data = None
+                if minute_df is not None and len(minute_df) >= 1:
+                    final_data = minute_df
+                elif df is not None and len(df) >= 1:
+                    final_data = df
 
-                final_price = float(minute_df.iloc[-1]["Close"])
+                # Ensure a fallback to `df` so result will always be calculated
+                if final_data is None or len(final_data) < 1:
+                    final_data = df
+
+                try:
+                    final_price = float(final_data.iloc[-1]["Close"])
+                except:
+                    final_price = float(df.iloc[-1]["Close"])
                 entry_price = float(entry.get("entry_price"))
                 direction = entry.get("direction")
 
@@ -872,18 +892,25 @@ def process_signal_list(
 
             base_key = _signal_key(signal_time, direction)
 
-            # Use cached 1-minute data for PRE-SIGNAL confidence when available
-            pre_df = df
-            if minute_df is not None and len(minute_df) >= 200:
-                pre_df = minute_df
+            # Use cached 1-minute data for PRE-SIGNAL confidence when available.
+            # Determine whether this is a 'next' signal for thresholding.
+            is_next_signal = evaluated_signal_count > 0
+            base_threshold = 70 if is_next_signal else 75
+            threshold = get_adaptive_trade_threshold(base_threshold)
 
-            confidence = calculate_confidence(pre_df, direction)
+            # Prefer minute-level data for pre-signal calculation; fallback to provided df.
+            pre_df = minute_df if (minute_df is not None and len(minute_df) >= 200) else df
+            pre_confidence = calculate_confidence(pre_df, direction)
 
             seconds_to_entry = (signal_time - now).total_seconds()
             if PRE_SIGNAL_MIN_SECONDS <= seconds_to_entry <= PRE_SIGNAL_MAX_SECONDS and not signal.get("pre_sent"):
-                if confidence >= 70:
-                    messages.append(_build_pre_message(signal, confidence, pre_df))
+                # Only send pre-signal when the confidence meets the same adaptive threshold
+                if pre_confidence >= threshold:
+                    messages.append(_build_pre_message(signal, pre_confidence, pre_df))
                     signal["pre_sent"] = True
+                    # Persist the pre-calculated confidence so confirmation uses the same value
+                    signal["pre_confidence"] = pre_confidence
+                    print(f"FINAL CONFIDENCE USED: {pre_confidence}%")
 
             if abs((now - signal_time).total_seconds()) <= SIGNAL_WINDOW_SECONDS:
                 if base_key in processed_signals:
@@ -895,8 +922,17 @@ def process_signal_list(
                     # Silent skip for this cycle when exact 1min data is unavailable.
                     continue
 
-                confidence = calculate_confidence(signal_df, direction)
+                # Use any pre-calculated confidence if present so pre-signal and confirmation match.
+                pre_conf = signal.get("pre_confidence")
                 is_next_signal = evaluated_signal_count > 0
+                if pre_conf is not None:
+                    confidence = pre_conf
+                else:
+                    confidence = calculate_confidence(signal_df, direction)
+
+                # Debug log final confidence used for decision
+                print(f"FINAL CONFIDENCE USED: {confidence}%")
+
                 should_take, _ = _should_take_signal(signal_df, direction, confidence, is_next_signal)
 
                 if should_take:
@@ -916,8 +952,8 @@ def process_signal_list(
                             confidence=confidence,
                             df=signal_df,
                         )
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        print(f"store_tracked_signal error: {e}")
                     signal["confirmed_sent"] = True
                     signal["martingale_confidence"] = confidence
                     confirmed_signal_count += 1
@@ -937,17 +973,23 @@ def process_signal_list(
                 MARTINGALE_PREALERT_MIN_SECONDS <= seconds_to_mg <= MARTINGALE_PREALERT_MAX_SECONDS
                 and not signal.get("martingale_prealert_sent")
             ):
-                if _is_strong_martingale(df, direction):
-                    mg_confidence = calculate_confidence(df, direction)
+                # Prefer 1-minute data for martingale checks; fallback to main df
+                mg_df = minute_df if (minute_df is not None and len(minute_df) >= 200) else df
+                if _is_strong_martingale(mg_df, direction):
+                    mg_confidence = calculate_confidence(mg_df, direction)
                     signal["martingale_confidence"] = mg_confidence
-                    messages.append(_build_mg_pre_message(signal, mg_confidence, df))
+                    messages.append(_build_mg_pre_message(signal, mg_confidence, mg_df))
+                    print(f"FINAL CONFIDENCE USED: {mg_confidence}%")
                     signal["martingale_prealert_sent"] = True
 
             if abs((now - mg_time).total_seconds()) <= SIGNAL_WINDOW_SECONDS:
-                if mg_key not in processed_signals and _is_strong_martingale(df, direction):
-                    mg_confidence = calculate_confidence(df, direction)
+                # Prefer 1-minute data for martingale confirmation; fallback to main df
+                mg_df = minute_df if (minute_df is not None and len(minute_df) >= 200) else df
+                if mg_key not in processed_signals and _is_strong_martingale(mg_df, direction):
+                    mg_confidence = calculate_confidence(mg_df, direction)
                     signal["martingale_confidence"] = mg_confidence
-                    _, tp, sl = build_forex_targets(df, direction, mg_confidence)
+                    print(f"FINAL CONFIDENCE USED: {mg_confidence}%")
+                    _, tp, sl = build_forex_targets(mg_df, direction, mg_confidence)
                     expiry = mg_time + timedelta(minutes=5)
                     messages.append(
                         _build_mg_confirm_message(
@@ -956,12 +998,12 @@ def process_signal_list(
                             expiry,
                             tp,
                             sl,
-                            df,
+                            mg_df,
                         )
                     )
                     # Store martingale confirmed signal
                     try:
-                        entry_price = float(df.iloc[-1]["Close"])
+                        entry_price = float(mg_df.iloc[-1]["Close"])
                         store_tracked_signal(
                             signal_time=mg_time,
                             direction=direction,
@@ -970,10 +1012,10 @@ def process_signal_list(
                             signal_type="martingale",
                             pair=signal.get("pair", "EURUSD"),
                             confidence=mg_confidence,
-                            df=df,
+                            df=mg_df,
                         )
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        print(f"store_tracked_signal error: {e}")
                     processed_signals.add(mg_key)
                     signal["martingale_confirmed_sent"] = True
                     print(f"Signal confirmed: {mg_time:%H:%M} {direction}")

@@ -34,13 +34,13 @@ HIGH_IMPACT_NEWS_EVENTS = [
     # Add high-impact event times in Asia/Kolkata timezone.
     # Example: "2026-05-03 18:00"
 ]
-MAX_SIGNAL_MESSAGES_PER_CYCLE = 5
+MAX_SIGNAL_MESSAGES_PER_CYCLE = 10
 
 LAST_SIGNAL_INPUT_UPDATE_ID = None
 
 # API rate limiting
 API_CALL_TIMES = []
-API_CALLS_PER_MINUTE_LIMIT = 7
+API_CALLS_PER_MINUTE_LIMIT = 6
 
 
 def track_api_call():
@@ -237,7 +237,7 @@ def get_data(interval):
 
         if res.get("code") == 429:
             send_telegram("*API Rate Limit Hit*\n\nWaiting 60 seconds before retry.")
-            time.sleep(60)
+            time.sleep(65)
             return None
 
         send_telegram(f"*API Error*\n\n{res}")
@@ -264,11 +264,27 @@ def get_data(interval):
 
 def run_external_signal_engine(df, cached_minute_df=None):
     """Run external signal processing, optionally using cached minute data."""
+    # Ensure we always pass a usable `df` into process_signal_list so external
+    # signal processing runs even when the auto-bot skipped or df is small.
+    # Prefer provided `df`, then cached_minute_df, then attempt a fresh 5min fetch.
+    if df is None or (hasattr(df, "__len__") and len(df) < 200):
+        fallback_df = None
+        if cached_minute_df is not None and len(cached_minute_df) >= 200:
+            fallback_df = cached_minute_df
+        elif is_api_call_allowed():
+            try:
+                fallback_df = get_data("5min")
+            except Exception:
+                fallback_df = None
+
+        if fallback_df is not None and len(fallback_df) >= 200:
+            df = fallback_df
+
     if cached_minute_df is not None:
         minute_data_fetcher = lambda: cached_minute_df
     else:
         minute_data_fetcher = lambda: get_data("1min") if is_api_call_allowed() else None
-    
+
     signal_messages = process_signal_list(df, minute_data_fetcher=minute_data_fetcher)
     for signal_message in signal_messages[:MAX_SIGNAL_MESSAGES_PER_CYCLE]:
         send_telegram(signal_message)
@@ -355,6 +371,9 @@ def run():
             df = add_indicators(df)
             confidence, grade = calculate_score(df)
             trade_threshold = get_adaptive_trade_threshold(75)
+
+            # Debug: print final confidence used by bot decision path
+            print(f"FINAL CONFIDENCE USED: {confidence}%")
 
             if confidence < trade_threshold:
                 print(f"Signal rejected - confidence too low: {confidence}% (threshold {trade_threshold}%)")
