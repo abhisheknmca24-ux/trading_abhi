@@ -38,6 +38,26 @@ MAX_SIGNAL_MESSAGES_PER_CYCLE = 5
 
 LAST_SIGNAL_INPUT_UPDATE_ID = None
 
+# API rate limiting
+API_CALL_TIMES = []
+API_CALLS_PER_MINUTE_LIMIT = 7
+
+
+def track_api_call():
+    """Track API call timestamp for rate limiting."""
+    now = time.time()
+    API_CALL_TIMES.append(now)
+    # Remove calls older than 60 seconds
+    API_CALL_TIMES[:] = [t for t in API_CALL_TIMES if now - t < 60]
+
+
+def is_api_call_allowed():
+    """Check if we can make another API call within rate limit."""
+    now = time.time()
+    # Remove calls older than 60 seconds
+    recent_calls = [t for t in API_CALL_TIMES if now - t < 60]
+    return len(recent_calls) < API_CALLS_PER_MINUTE_LIMIT
+
 
 if not TD_API_KEY:
     raise ValueError("TD_API_KEY is missing or empty")
@@ -196,6 +216,10 @@ def fetch_signal_text_from_telegram():
 # DATA FETCH
 # ==============================
 def get_data(interval):
+    if not is_api_call_allowed():
+        print(f"API rate limit reached. Skipping {interval} data fetch.")
+        return None
+
     url = "https://api.twelvedata.com/time_series"
 
     params = {
@@ -206,13 +230,14 @@ def get_data(interval):
     }
 
     res = requests.get(url, params=params).json()
+    track_api_call()
 
     if "values" not in res:
         print("API ERROR:", res)
 
         if res.get("code") == 429:
-            send_telegram("*API LIMIT HIT*\n\nBot paused for 1 hour.")
-            time.sleep(3600)
+            send_telegram("*API Rate Limit Hit*\n\nWaiting 60 seconds before retry.")
+            time.sleep(60)
             return None
 
         send_telegram(f"*API Error*\n\n{res}")
@@ -237,8 +262,14 @@ def get_data(interval):
     return df
 
 
-def run_external_signal_engine(df):
-    signal_messages = process_signal_list(df, minute_data_fetcher=lambda: get_data("1min"))
+def run_external_signal_engine(df, cached_minute_df=None):
+    """Run external signal processing, optionally using cached minute data."""
+    if cached_minute_df is not None:
+        minute_data_fetcher = lambda: cached_minute_df
+    else:
+        minute_data_fetcher = lambda: get_data("1min") if is_api_call_allowed() else None
+    
+    signal_messages = process_signal_list(df, minute_data_fetcher=minute_data_fetcher)
     for signal_message in signal_messages[:MAX_SIGNAL_MESSAGES_PER_CYCLE]:
         send_telegram(signal_message)
 
@@ -255,6 +286,8 @@ def run():
     cached_interval = None
     cached_candle_key = None
     cached_df = None
+    cached_minute_df = None
+    cached_minute_time = None
 
     while True:
         try:
@@ -280,7 +313,7 @@ def run():
 
             if force_fast_mode:
                 interval = "1min"
-                sleep_time = 15
+                sleep_time = 20
             else:
                 interval = "5min"
                 sleep_time = SLEEP_TIME
@@ -307,6 +340,17 @@ def run():
                 time.sleep(sleep_time)
                 continue
 
+            # Cache 1-minute data once per minute for all signal processing
+            now_timestamp = pd.Timestamp.now(tz="Asia/Kolkata")
+            now_minute_key = now_timestamp.floor("min")
+            
+            if cached_minute_df is None or cached_minute_time != now_minute_key:
+                if is_api_call_allowed():
+                    cached_minute_df = get_data("1min")
+                    cached_minute_time = now_minute_key
+                else:
+                    cached_minute_df = None
+
             # 4) Run auto bot logic.
             df = add_indicators(df)
             confidence, grade = calculate_score(df)
@@ -315,7 +359,7 @@ def run():
             if confidence < trade_threshold:
                 print(f"Signal rejected - confidence too low: {confidence}% (threshold {trade_threshold}%)")
                 # 5) Run external signal processing after auto bot.
-                run_external_signal_engine(df)
+                run_external_signal_engine(df, cached_minute_df)
                 time.sleep(sleep_time)
                 continue
 
@@ -330,7 +374,7 @@ def run():
                     if cooldown_minutes < TRADE_COOLDOWN_MINUTES:
                         remaining = TRADE_COOLDOWN_MINUTES - cooldown_minutes
                         print(f"Trade cooldown active - {remaining:.1f} min remaining")
-                        run_external_signal_engine(df)
+                        run_external_signal_engine(df, cached_minute_df)
                         time.sleep(sleep_time)
                         continue
 
@@ -338,7 +382,7 @@ def run():
 
                 if news_blocked:
                     print(f"Trade blocked due to high-impact news at {news_time:%H:%M}")
-                    run_external_signal_engine(df)
+                    run_external_signal_engine(df, cached_minute_df)
                     time.sleep(sleep_time)
                     continue
 
@@ -346,7 +390,7 @@ def run():
 
                 if current_candle_time == last_signal_time:
                     print("Duplicate signal skipped")
-                    run_external_signal_engine(df)
+                    run_external_signal_engine(df, cached_minute_df)
                     time.sleep(sleep_time)
                     continue
 
@@ -425,7 +469,7 @@ Auto Close: {forex['auto_close']}
                 print("No signal")
 
             # 5) Process external signal list with the same df.
-            run_external_signal_engine(df)
+            run_external_signal_engine(df, cached_minute_df)
             time.sleep(sleep_time)
 
         except Exception as e:

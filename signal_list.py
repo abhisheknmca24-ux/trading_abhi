@@ -483,8 +483,8 @@ def _build_confirm_message(signal: dict, confidence: int, expiry: datetime, tp: 
 
 
 def _check_safety_rules(df: pd.DataFrame, direction: str, confidence: int) -> tuple[bool, str]:
-    if confidence < 60:
-        return False, "confidence below 60"
+    if confidence < 70:
+        return False, "confidence below 70"
 
     if df is None or len(df) < 200:
         return False, "insufficient data"
@@ -817,6 +817,16 @@ def process_signal_list(
     if daily_report:
         messages.append(daily_report)
 
+    # Fetch 1-minute data ONCE and reuse for all operations
+    minute_df = None
+    if minute_data_fetcher is not None:
+        try:
+            minute_df = minute_data_fetcher()
+            if minute_df is not None and len(minute_df) >= 200:
+                minute_df = add_indicators(minute_df)
+        except Exception:
+            minute_df = None
+
     # 1) Check for any tracked signals that have expired and report results
     try:
         for entry in list(tracked_signals):
@@ -826,21 +836,12 @@ def process_signal_list(
             if expiry is None:
                 continue
             if expiry <= now:
-                # need latest 1min data to determine final price
-                final_df = None
-                if minute_data_fetcher is not None:
-                    try:
-                        temp = minute_data_fetcher()
-                        if temp is not None and len(temp) >= 1:
-                            final_df = temp
-                    except Exception:
-                        final_df = None
-
-                if final_df is None:
+                # Use cached 1min data to determine final price
+                if minute_df is None or len(minute_df) < 1:
                     # cannot determine result without latest 1min data; skip for now
                     continue
 
-                final_price = float(final_df.iloc[-1]["Close"])
+                final_price = float(minute_df.iloc[-1]["Close"])
                 entry_price = float(entry.get("entry_price"))
                 direction = entry.get("direction")
 
@@ -871,13 +872,10 @@ def process_signal_list(
 
             base_key = _signal_key(signal_time, direction)
 
-            # Use fresh 1-minute data for PRE-SIGNAL confidence when available
+            # Use cached 1-minute data for PRE-SIGNAL confidence when available
             pre_df = df
-            if minute_data_fetcher is not None:
-                temp_df = minute_data_fetcher()
-                if temp_df is not None and len(temp_df) >= 200:
-                    temp_df = add_indicators(temp_df)
-                    pre_df = temp_df
+            if minute_df is not None and len(minute_df) >= 200:
+                pre_df = minute_df
 
             confidence = calculate_confidence(pre_df, direction)
 
@@ -891,15 +889,12 @@ def process_signal_list(
                 if base_key in processed_signals:
                     continue
 
-                signal_df = None
-                if minute_data_fetcher is not None:
-                    signal_df = minute_data_fetcher()
+                signal_df = minute_df
 
                 if signal_df is None or len(signal_df) < 200:
                     # Silent skip for this cycle when exact 1min data is unavailable.
                     continue
 
-                signal_df = add_indicators(signal_df)
                 confidence = calculate_confidence(signal_df, direction)
                 is_next_signal = evaluated_signal_count > 0
                 should_take, _ = _should_take_signal(signal_df, direction, confidence, is_next_signal)
