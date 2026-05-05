@@ -3,12 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 import re
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 import pandas as pd
-from ta.momentum import RSIIndicator
-from ta.trend import EMAIndicator
-from ta.volatility import AverageTrueRange
+
+from indicators import add_indicators
 
 try:
     from zoneinfo import ZoneInfo
@@ -18,7 +17,9 @@ except ImportError:  # pragma: no cover
 
 TIMEZONE_NAME = "Asia/Kolkata"
 MARKET_OPEN = time(13, 30)
-SIGNAL_WINDOW_SECONDS = 45
+SIGNAL_WINDOW_SECONDS = 75
+PRE_SIGNAL_MIN_SECONDS = 60
+PRE_SIGNAL_MAX_SECONDS = 120
 MARTINGALE_PREALERT_MIN_SECONDS = 45
 MARTINGALE_PREALERT_MAX_SECONDS = 150
 MARTINGALE_ENTRY_DELAY = timedelta(minutes=2)
@@ -37,6 +38,9 @@ signal_list = []
 processed_signals = set()
 last_update_id = None
 last_signal_update_time = None
+evaluated_signal_count = 0
+confirmed_signal_count = 0
+ENABLE_MARTINGALE = True
 
 
 def _get_timezone():
@@ -64,7 +68,6 @@ def _build_signal_state(entries: List[SignalEntry]) -> List[dict]:
             "direction": entry.direction,
             "pre_sent": False,
             "confirmed_sent": False,
-            "martingale_scheduled": False,
             "martingale_time": entry.signal_time + MARTINGALE_ENTRY_DELAY,
             "martingale_prealert_sent": False,
             "martingale_confirmed_sent": False,
@@ -131,7 +134,7 @@ def load_signal_entries(signal_lines: List[str], current_day: Optional[date] = N
 
 
 def update_signal_list(signal_lines: Optional[List[str]] = None, now: Optional[datetime] = None) -> List[dict]:
-    global signal_list, processed_signals, last_update_id, last_signal_update_time
+    global signal_list, processed_signals, last_update_id, last_signal_update_time, evaluated_signal_count, confirmed_signal_count
 
     if now is None:
         now = _now()
@@ -143,6 +146,8 @@ def update_signal_list(signal_lines: Optional[List[str]] = None, now: Optional[d
         signal_list = []
         processed_signals = set()
         last_update_id = None
+        evaluated_signal_count = 0
+        confirmed_signal_count = 0
 
     if signal_lines is None:
         last_signal_update_time = now
@@ -158,6 +163,8 @@ def update_signal_list(signal_lines: Optional[List[str]] = None, now: Optional[d
         signal_list = []
         processed_signals = set()
         last_update_id = None
+        evaluated_signal_count = 0
+        confirmed_signal_count = 0
         last_signal_update_time = now
         return signal_list
 
@@ -167,6 +174,8 @@ def update_signal_list(signal_lines: Optional[List[str]] = None, now: Optional[d
         entries = load_signal_entries(signal_lines, current_day)
         signal_list = _build_signal_state(entries)
         processed_signals = set()
+        evaluated_signal_count = 0
+        confirmed_signal_count = 0
         last_update_id = update_id
         print("Signal list updated")
 
@@ -182,24 +191,31 @@ def apply_signal_text(signal_text: str, now: Optional[datetime] = None) -> List[
     return update_signal_list(lines, now)
 
 
-def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    working_df = df.copy()
+def should_force_fast_mode(now: Optional[datetime] = None, window_seconds: int = 180) -> bool:
+    if now is None:
+        now = _now()
 
-    required = {"EMA50", "EMA200", "RSI", "ATR", "TrendStrength"}
-    if required.issubset(set(working_df.columns)):
-        return working_df
+    for signal in signal_list:
+        try:
+            signal_time = signal.get("time")
+            direction = signal.get("direction")
+            if signal_time is None:
+                continue
+            if signal_time.date() != now.date():
+                continue
+            if signal_time.time() < MARKET_OPEN:
+                continue
 
-    working_df["EMA50"] = EMAIndicator(working_df["Close"], 50).ema_indicator()
-    working_df["EMA200"] = EMAIndicator(working_df["Close"], 200).ema_indicator()
-    working_df["RSI"] = RSIIndicator(working_df["Close"], 14).rsi()
-    working_df["ATR"] = AverageTrueRange(
-        working_df["High"],
-        working_df["Low"],
-        working_df["Close"],
-        14,
-    ).average_true_range()
-    working_df["TrendStrength"] = (working_df["EMA50"] - working_df["EMA200"]).abs()
-    return working_df
+            if direction is not None and _signal_key(signal_time, direction) in processed_signals:
+                continue
+
+            seconds_to_signal = (signal_time - now).total_seconds()
+            if 0 <= seconds_to_signal <= window_seconds:
+                return True
+        except Exception:
+            continue
+
+    return False
 
 
 def validate_sniper_signal(df: pd.DataFrame, direction: str) -> bool:
@@ -362,6 +378,79 @@ def _build_confirm_message(signal: dict, confidence: int, expiry: datetime, tp: 
     )
 
 
+def _check_safety_rules(df: pd.DataFrame, direction: str, confidence: int) -> tuple[bool, str]:
+    if confidence < 60:
+        return False, "confidence below 60"
+
+    if df is None or len(df) < 200:
+        return False, "insufficient data"
+
+    df = add_indicators(df)
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+
+    required_values = [
+        last["EMA50"],
+        last["EMA200"],
+        last["RSI"],
+        prev["RSI"],
+        last["ATR"],
+        df["ATR"].mean(),
+    ]
+    if any(pd.isna(value) for value in required_values):
+        return False, "indicator values unavailable"
+
+    atr = float(last["ATR"])
+    atr_mean = float(df["ATR"].mean())
+    trend_gap = abs(float(last["EMA50"]) - float(last["EMA200"]))
+    trend_threshold = max(0.0002, atr * 0.15)
+
+    if direction == "CALL":
+        trend_direction_ok = float(last["EMA50"]) > float(last["EMA200"])
+        rsi_opposite_extreme = float(last["RSI"]) < 35
+    else:
+        trend_direction_ok = float(last["EMA50"]) < float(last["EMA200"])
+        rsi_opposite_extreme = float(last["RSI"]) > 65
+
+    if not trend_direction_ok or trend_gap <= trend_threshold:
+        return False, "trend unclear"
+
+    if rsi_opposite_extreme:
+        return False, "RSI extreme opposite"
+
+    if atr <= atr_mean:
+        return False, "low volatility"
+
+    return True, "safety passed"
+
+
+def _is_strong_martingale(df: pd.DataFrame, direction: str) -> bool:
+    if not validate_martingale_signal(df, direction):
+        return False
+
+    confidence = calculate_confidence(df, direction)
+    return confidence >= 75
+
+
+def _should_take_signal(df: pd.DataFrame, direction: str, confidence: int, is_next_signal: bool) -> tuple[bool, str]:
+    safety_ok, safety_reason = _check_safety_rules(df, direction, confidence)
+    if not safety_ok:
+        return False, safety_reason
+
+    # First signal is strict: only high-confidence entries.
+    if not is_next_signal:
+        if confidence >= 75:
+            return True, "confidence >= 75"
+        return False, "first signal confidence below 75"
+
+    if is_next_signal:
+        if confidence >= 70:
+            return True, "next signal confidence >= 70"
+        return False, "next signal confidence below 70"
+
+    return False, "signal rejected"
+
+
 def _build_mg_pre_message(signal: dict, confidence: int) -> str:
     return (
         f"*MARTINGALE PRE-ALERT*\n\n"
@@ -385,8 +474,11 @@ def _build_mg_confirm_message(signal: dict, confidence: int, expiry: datetime, t
     )
 
 
-def process_signal_list(df: pd.DataFrame) -> List[str]:
-    global signal_list, processed_signals
+def process_signal_list(
+    df: pd.DataFrame,
+    minute_data_fetcher: Optional[Callable[[], Optional[pd.DataFrame]]] = None,
+) -> List[str]:
+    global signal_list, processed_signals, evaluated_signal_count, confirmed_signal_count
 
     if df is None or len(df) < 200:
         return []
@@ -408,23 +500,40 @@ def process_signal_list(df: pd.DataFrame) -> List[str]:
             confidence = calculate_confidence(df, direction)
 
             seconds_to_entry = (signal_time - now).total_seconds()
-            if 45 <= seconds_to_entry <= 150 and not signal.get("pre_sent"):
-                if validate_sniper_signal(df, direction):
-                    messages.append(_build_pre_message(signal, confidence))
-                    signal["pre_sent"] = True
+            if PRE_SIGNAL_MIN_SECONDS <= seconds_to_entry <= PRE_SIGNAL_MAX_SECONDS and not signal.get("pre_sent"):
+                messages.append(_build_pre_message(signal, confidence))
+                signal["pre_sent"] = True
 
             if abs((now - signal_time).total_seconds()) <= SIGNAL_WINDOW_SECONDS:
-                if base_key not in processed_signals and validate_sniper_signal(df, direction):
-                    _, tp, sl = build_forex_targets(df, direction, confidence)
+                if base_key in processed_signals:
+                    continue
+
+                signal_df = None
+                if minute_data_fetcher is not None:
+                    signal_df = minute_data_fetcher()
+
+                if signal_df is None or len(signal_df) < 200:
+                    # Silent skip for this cycle when exact 1min data is unavailable.
+                    continue
+
+                signal_df = add_indicators(signal_df)
+                confidence = calculate_confidence(signal_df, direction)
+                is_next_signal = evaluated_signal_count > 0
+                should_take, _ = _should_take_signal(signal_df, direction, confidence, is_next_signal)
+
+                if should_take:
+                    _, tp, sl = build_forex_targets(signal_df, direction, confidence)
                     expiry = signal_time + timedelta(minutes=5)
                     messages.append(_build_confirm_message(signal, confidence, expiry, tp, sl))
-                    processed_signals.add(base_key)
                     signal["confirmed_sent"] = True
-                    signal["martingale_scheduled"] = True
                     signal["martingale_confidence"] = confidence
+                    confirmed_signal_count += 1
                     print(f"Signal confirmed: {signal_time:%H:%M} {direction}")
 
-            if not signal.get("martingale_scheduled"):
+                processed_signals.add(base_key)
+                evaluated_signal_count += 1
+
+            if not ENABLE_MARTINGALE:
                 continue
 
             mg_time = signal["martingale_time"]
@@ -435,14 +544,14 @@ def process_signal_list(df: pd.DataFrame) -> List[str]:
                 MARTINGALE_PREALERT_MIN_SECONDS <= seconds_to_mg <= MARTINGALE_PREALERT_MAX_SECONDS
                 and not signal.get("martingale_prealert_sent")
             ):
-                if validate_martingale_signal(df, direction):
+                if _is_strong_martingale(df, direction):
                     mg_confidence = calculate_confidence(df, direction)
                     signal["martingale_confidence"] = mg_confidence
                     messages.append(_build_mg_pre_message(signal, mg_confidence))
                     signal["martingale_prealert_sent"] = True
 
             if abs((now - mg_time).total_seconds()) <= SIGNAL_WINDOW_SECONDS:
-                if mg_key not in processed_signals and validate_martingale_signal(df, direction):
+                if mg_key not in processed_signals and _is_strong_martingale(df, direction):
                     mg_confidence = calculate_confidence(df, direction)
                     signal["martingale_confidence"] = mg_confidence
                     _, tp, sl = build_forex_targets(df, direction, mg_confidence)

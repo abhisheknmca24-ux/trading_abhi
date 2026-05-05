@@ -14,7 +14,7 @@ else:
 from fixed_trade import get_fixed_signal
 from forex_trade import get_forex_signal
 from indicators import add_indicators, calculate_score
-from signal_list import apply_signal_text, process_signal_list, update_signal_list
+from signal_list import apply_signal_text, process_signal_list, should_force_fast_mode, update_signal_list
 
 PAIR = "EUR/USD"
 SLEEP_TIME = 120   # 2 minutes
@@ -27,6 +27,7 @@ HIGH_IMPACT_NEWS_EVENTS = [
     # Add high-impact event times in Asia/Kolkata timezone.
     # Example: "2026-05-03 18:00"
 ]
+MAX_SIGNAL_MESSAGES_PER_CYCLE = 5
 
 LAST_SIGNAL_INPUT_UPDATE_ID = None
 
@@ -230,7 +231,8 @@ def get_data(interval):
 
 
 def run_external_signal_engine(df):
-    for signal_message in process_signal_list(df):
+    signal_messages = process_signal_list(df, minute_data_fetcher=lambda: get_data("1min"))
+    for signal_message in signal_messages[:MAX_SIGNAL_MESSAGES_PER_CYCLE]:
         send_telegram(signal_message)
 
 
@@ -241,7 +243,6 @@ def run():
     print("BOT RUNNING")
     send_telegram("*Bot Started*\n\nSmart Mode Active.")
 
-    mode = "normal"
     last_signal_time = None
     last_trade_time = None
     cached_interval = None
@@ -268,7 +269,9 @@ def run():
 
             print("Market Open — Running")
 
-            if mode == "fast":
+            force_fast_mode = should_force_fast_mode()
+
+            if force_fast_mode:
                 interval = "1min"
                 sleep_time = 15
             else:
@@ -300,11 +303,6 @@ def run():
             # 4) Run auto bot logic.
             df = add_indicators(df)
             confidence, grade = calculate_score(df)
-
-            if confidence >= 80 and is_near_candle_close():
-                mode = "fast"
-            else:
-                mode = "normal"
 
             if confidence < 75:
                 print(f"Signal rejected - confidence too low: {confidence}%")
@@ -397,7 +395,6 @@ Auto Close: {forex['auto_close']}
                 send_telegram(msg)
                 last_signal_time = current_candle_time
                 last_trade_time = pd.Timestamp.now(tz="Asia/Kolkata")
-                mode = "normal"
 
             else:
                 print("No signal")
