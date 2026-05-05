@@ -14,7 +14,14 @@ else:
 from fixed_trade import get_fixed_signal
 from forex_trade import get_forex_signal
 from indicators import add_indicators, calculate_score
-from signal_list import apply_signal_text, process_signal_list, should_force_fast_mode, update_signal_list
+from signal_list import (
+    apply_signal_text,
+    get_adaptive_trade_threshold,
+    process_signal_list,
+    should_force_fast_mode,
+    store_tracked_signal,
+    update_signal_list,
+)
 
 PAIR = "EUR/USD"
 SLEEP_TIME = 120   # 2 minutes
@@ -303,9 +310,10 @@ def run():
             # 4) Run auto bot logic.
             df = add_indicators(df)
             confidence, grade = calculate_score(df)
+            trade_threshold = get_adaptive_trade_threshold(75)
 
-            if confidence < 75:
-                print(f"Signal rejected - confidence too low: {confidence}%")
+            if confidence < trade_threshold:
+                print(f"Signal rejected - confidence too low: {confidence}% (threshold {trade_threshold}%)")
                 # 5) Run external signal processing after auto bot.
                 run_external_signal_engine(df)
                 time.sleep(sleep_time)
@@ -393,6 +401,23 @@ Auto Close: {forex['auto_close']}
 
                 print(msg)
                 send_telegram(msg)
+                try:
+                    entry_price = float(df.iloc[-1]["Close"])
+                    expiry_time = pd.Timestamp.now(tz="Asia/Kolkata") + pd.Timedelta(minutes=5)
+
+                    store_tracked_signal(
+                        signal_time=pd.Timestamp.now(tz="Asia/Kolkata"),
+                        direction=forex["direction"],
+                        entry_price=entry_price,
+                        expiry_time=expiry_time,
+                        signal_type="auto_trade",
+                        pair="EURUSD",
+                        confidence=confidence,
+                        df=df,
+                    )
+                except Exception as e:
+                    print("Tracking error:", e)
+
                 last_signal_time = current_candle_time
                 last_trade_time = pd.Timestamp.now(tz="Asia/Kolkata")
 

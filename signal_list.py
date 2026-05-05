@@ -41,6 +41,13 @@ last_signal_update_time = None
 evaluated_signal_count = 0
 confirmed_signal_count = 0
 ENABLE_MARTINGALE = True
+ 
+# Result tracking
+tracked_signals: List[dict] = []
+total_trades = 0
+wins = 0
+losses = 0
+last_daily_report_date = None
 
 
 def _get_timezone():
@@ -354,27 +361,124 @@ def build_forex_targets(df: pd.DataFrame, direction: str, confidence: int) -> tu
     return round(entry, 5), round(tp, 5), round(sl, 5)
 
 
-def _build_pre_message(signal: dict, confidence: int) -> str:
+def _get_ema_trend(df: pd.DataFrame, direction: str) -> str:
+    """Determine if EMA trend is Bullish or Bearish."""
+    last = df.iloc[-1]
+    normalized_direction = str(direction).upper()
+
+    if normalized_direction in {"CALL", "BUY"}:
+        if last["EMA50"] > last["EMA200"]:
+            return "Bullish 📈"
+        else:
+            return "Bearish 📉"
+    else:
+        if last["EMA50"] < last["EMA200"]:
+            return "Bearish 📉"
+        else:
+            return "Bullish 📈"
+
+
+def _get_rsi_interpretation(rsi: float) -> str:
+    """Interpret RSI value."""
+    if rsi >= 70:
+        return "Overbought"
+    elif rsi >= 60:
+        return "Moderate Bullish"
+    elif rsi > 50:
+        return "Slightly Bullish"
+    elif rsi == 50:
+        return "Neutral"
+    elif rsi > 40:
+        return "Slightly Bearish"
+    elif rsi >= 30:
+        return "Moderate Bearish"
+    else:
+        return "Oversold"
+
+
+def _get_atr_strength(df: pd.DataFrame) -> str:
+    """Determine ATR strength as Low/Medium/High."""
+    last = df.iloc[-1]
+    atr = float(last["ATR"])
+    atr_mean = float(df["ATR"].mean())
+    
+    if atr < atr_mean:
+        return "Low Volatility"
+    elif atr < atr_mean * 1.3:
+        return "Medium Volatility"
+    else:
+        return "High Volatility 🔥"
+
+
+def _get_candle_strength(df: pd.DataFrame) -> str:
+    """Determine candle strength as Weak/Strong."""
+    last = df.iloc[-1]
+    candle_size = abs(float(last["Close"]) - float(last["Open"]))
+    avg_candle = float((df["Close"] - df["Open"]).abs().tail(10).mean())
+    
+    if candle_size < avg_candle:
+        return "Weak"
+    else:
+        return "Strong 💪"
+
+
+def _build_pre_message(signal: dict, confidence: int, df: pd.DataFrame) -> str:
+    """Build pre-signal message with full indicator analysis."""
+    last = df.iloc[-1]
+    rsi = float(last["RSI"]) if not pd.isna(last["RSI"]) else 0
+    ema_trend = _get_ema_trend(df, signal['direction'])
+    rsi_interp = _get_rsi_interpretation(rsi)
+    atr_strength = _get_atr_strength(df)
+    candle_strength = _get_candle_strength(df)
+    
     return (
-        f"*PRE-SIGNAL*\n\n"
+        f"📊 *PRE-SIGNAL*\n\n"
         f"Pair: {signal['pair']}\n"
         f"Direction: {signal['direction']}\n"
-        f"Time: {signal['time']:%H:%M}\n"
+        f"Time: {signal['time']:%H:%M}\n\n"
         f"Confidence: {confidence}%\n\n"
-        f"FIRST TRADE"
+        f"*Technical Analysis*\n"
+        f"EMA Trend: {ema_trend}\n"
+        f"RSI: {rsi:.0f} ({rsi_interp})\n"
+        f"ATR: {atr_strength}\n"
+        f"Candle Strength: {candle_strength}\n\n"
+        f"Status: Preparing for entry ⏳"
     )
 
 
-def _build_confirm_message(signal: dict, confidence: int, expiry: datetime, tp: float, sl: float) -> str:
+def _build_confirm_message(signal: dict, confidence: int, expiry: datetime, tp: float, sl: float, df: pd.DataFrame) -> str:
+    """Build confirmed signal message with full indicator analysis."""
+    last = df.iloc[-1]
+    rsi = float(last["RSI"]) if not pd.isna(last["RSI"]) else 0
+    ema_trend = _get_ema_trend(df, signal['direction'])
+    rsi_interp = _get_rsi_interpretation(rsi)
+    atr_strength = _get_atr_strength(df)
+    candle_strength = _get_candle_strength(df)
+    
+    # Determine signal quality based on confidence
+    if confidence >= 85:
+        signal_quality = "HIGH PROBABILITY TRADE ✅"
+    elif confidence >= 75:
+        signal_quality = "STRONG SIGNAL ✅"
+    else:
+        signal_quality = "VALID SIGNAL ✓"
+    
     return (
-        f"*CONFIRMED SIGNAL*\n\n"
+        f"📊 *SIGNAL CONFIRMED*\n\n"
         f"Pair: {signal['pair']}\n"
-        f"Direction: {signal['direction']}\n"
-        f"Entry time: {signal['time']:%H:%M}\n"
+        f"Direction: {signal['direction']}\n\n"
+        f"Confidence: {confidence}%\n\n"
+        f"*Technical Analysis*\n"
+        f"EMA Trend: {ema_trend}\n"
+        f"RSI: {rsi:.0f} ({rsi_interp})\n"
+        f"ATR: {atr_strength}\n"
+        f"Candle Strength: {candle_strength}\n\n"
+        f"*Trade Details*\n"
+        f"Entry Time: {signal['time']:%H:%M}\n"
         f"Expiry: {expiry:%H:%M}\n"
-        f"Confidence: {confidence}%\n"
-        f"Forex TP: {tp}\n"
-        f"Forex SL: {sl}"
+        f"TP: {tp}\n"
+        f"SL: {sl}\n\n"
+        f"Decision: {signal_quality}"
     )
 
 
@@ -418,6 +522,11 @@ def _check_safety_rules(df: pd.DataFrame, direction: str, confidence: int) -> tu
     if rsi_opposite_extreme:
         return False, "RSI extreme opposite"
 
+    if direction == "CALL" and float(last["RSI"]) < 55:
+        return False, "RSI weak zone"
+    if direction == "PUT" and float(last["RSI"]) > 45:
+        return False, "RSI weak zone"
+
     if atr <= atr_mean:
         return False, "low volatility"
 
@@ -438,40 +547,257 @@ def _should_take_signal(df: pd.DataFrame, direction: str, confidence: int, is_ne
         return False, safety_reason
 
     # First signal is strict: only high-confidence entries.
-    if not is_next_signal:
-        if confidence >= 75:
-            return True, "confidence >= 75"
-        return False, "first signal confidence below 75"
+    base_threshold = 70 if is_next_signal else 75
+    threshold = get_adaptive_trade_threshold(base_threshold)
+
+    if confidence >= threshold:
+        return True, f"confidence >= {threshold}"
 
     if is_next_signal:
-        if confidence >= 70:
-            return True, "next signal confidence >= 70"
-        return False, "next signal confidence below 70"
+        return False, f"next signal confidence below {threshold}"
 
-    return False, "signal rejected"
+    return False, f"first signal confidence below {threshold}"
 
 
-def _build_mg_pre_message(signal: dict, confidence: int) -> str:
+def _is_trade_direction(direction: str) -> bool:
+    return str(direction).upper() in {"CALL", "BUY"}
+
+
+def _get_resolved_trades() -> List[dict]:
+    return [entry for entry in tracked_signals if entry.get("resolved")]
+
+
+def _get_recent_resolved_trades(limit: int = 10) -> List[dict]:
+    resolved = _get_resolved_trades()
+    resolved.sort(key=lambda entry: entry.get("signal_time") or datetime.min)
+    return resolved[-limit:]
+
+
+def _confidence_bucket(confidence: float) -> str:
+    if confidence >= 80:
+        return ">=80"
+    if confidence >= 70:
+        return "70-79"
+    return "<70"
+
+
+def _win_rate(trades: List[dict]) -> float:
+    if not trades:
+        return 0.0
+    wins_count = sum(1 for trade in trades if trade.get("result") == "WIN")
+    return (wins_count / len(trades)) * 100
+
+
+def get_trade_performance() -> dict:
+    resolved = _get_resolved_trades()
+    resolved_total = len(resolved)
+    resolved_wins = sum(1 for trade in resolved if trade.get("result") == "WIN")
+    resolved_losses = sum(1 for trade in resolved if trade.get("result") == "LOSS")
+    overall_win_rate = (resolved_wins / resolved_total * 100) if resolved_total else 0.0
+
+    confidence_buckets = {">=80": [], "70-79": [], "<70": []}
+    for trade in resolved:
+        confidence = trade.get("confidence")
+        if confidence is None:
+            continue
+        confidence_buckets[_confidence_bucket(float(confidence))].append(trade)
+
+    bucket_stats = {}
+    for bucket, trades in confidence_buckets.items():
+        bucket_total = len(trades)
+        bucket_wins = sum(1 for trade in trades if trade.get("result") == "WIN")
+        bucket_stats[bucket] = {
+            "total": bucket_total,
+            "wins": bucket_wins,
+            "losses": bucket_total - bucket_wins,
+            "win_rate": (bucket_wins / bucket_total * 100) if bucket_total else 0.0,
+        }
+
+    recent_10 = _get_recent_resolved_trades(10)
+
+    return {
+        "total_trades": resolved_total,
+        "wins": resolved_wins,
+        "losses": resolved_losses,
+        "win_rate": overall_win_rate,
+        "recent_10_win_rate": _win_rate(recent_10),
+        "confidence_buckets": bucket_stats,
+    }
+
+
+def get_adaptive_trade_threshold(base_threshold: int = 75) -> int:
+    recent_10 = _get_recent_resolved_trades(10)
+    if not recent_10:
+        return base_threshold
+
+    recent_win_rate = _win_rate(recent_10)
+    if recent_win_rate < 50:
+        return base_threshold + 5
+    if recent_win_rate > 70:
+        return 70
+    return base_threshold
+
+
+def store_tracked_signal(
+    signal_time: datetime,
+    direction: str,
+    entry_price: float,
+    expiry_time: datetime,
+    signal_type: str,
+    pair: str,
+    confidence: float,
+    df: pd.DataFrame,
+) -> None:
+    global tracked_signals
+    last = df.iloc[-1]
+    tracked_signals.append({
+        "signal_time": signal_time,
+        "direction": direction,
+        "entry_price": float(entry_price),
+        "expiry_time": expiry_time,
+        "signal_type": signal_type,
+        "pair": pair,
+        "confidence": float(confidence),
+        "rsi": float(last["RSI"]) if not pd.isna(last["RSI"]) else None,
+        "atr": float(last["ATR"]) if not pd.isna(last["ATR"]) else None,
+        "ema_trend": _get_ema_trend(df, direction),
+        "resolved": False,
+    })
+
+    # Memory management: keep only last 200 trades
+    if len(tracked_signals) > 200:
+        tracked_signals[:] = tracked_signals[-200:]
+
+
+def _build_performance_report() -> str:
+    stats = get_trade_performance()
     return (
-        f"*MARTINGALE PRE-ALERT*\n\n"
-        f"Pair: {signal['pair']}\n"
-        f"Direction: {signal['direction']}\n"
-        f"Time: {signal['martingale_time']:%H:%M}\n"
-        f"Confidence: {confidence}%"
+        f"📊 Performance Report\n"
+        f"Total Trades: {stats['total_trades']}\n"
+        f"Wins: {stats['wins']}\n"
+        f"Losses: {stats['losses']}\n"
+        f"Win Rate: {stats['win_rate']:.1f}%\n\n"
+        f"Win Rate >=80: {stats['confidence_buckets']['>=80']['win_rate']:.1f}%\n"
+        f"Win Rate 70-79: {stats['confidence_buckets']['70-79']['win_rate']:.1f}%\n"
+        f"Win Rate <70: {stats['confidence_buckets']['<70']['win_rate']:.1f}%"
     )
 
 
-def _build_mg_confirm_message(signal: dict, confidence: int, expiry: datetime, tp: float, sl: float) -> str:
+def _maybe_build_daily_report(now: datetime) -> Optional[str]:
+    global last_daily_report_date
+
+    report_date = now.date() - timedelta(days=1)
+    if last_daily_report_date == report_date:
+        return None
+
+    resolved_for_day = [
+        trade for trade in _get_resolved_trades()
+        if trade.get("signal_time") is not None and trade["signal_time"].date() == report_date
+    ]
+
+    if not resolved_for_day:
+        return None
+
+    day_stats = {
+        "total_trades": len(resolved_for_day),
+        "wins": sum(1 for trade in resolved_for_day if trade.get("result") == "WIN"),
+        "losses": sum(1 for trade in resolved_for_day if trade.get("result") == "LOSS"),
+    }
+    day_stats["win_rate"] = (day_stats["wins"] / day_stats["total_trades"] * 100) if day_stats["total_trades"] else 0.0
+    day_stats["best_trades"] = sum(1 for trade in resolved_for_day if float(trade.get("confidence") or 0) >= 80 and trade.get("result") == "WIN")
+
+    last_daily_report_date = report_date
+
     return (
-        f"*MARTINGALE CONFIRMED*\n\n"
+        f"📊 Performance Report\n"
+        f"Total Trades: {day_stats['total_trades']}\n"
+        f"Wins: {day_stats['wins']}\n"
+        f"Losses: {day_stats['losses']}\n"
+        f"Win Rate: {day_stats['win_rate']:.1f}%\n"
+        f"Best Trades: {day_stats['best_trades']}"
+    )
+
+
+def _build_mg_pre_message(signal: dict, confidence: int, df: pd.DataFrame) -> str:
+    """Build martingale pre-alert message with indicator analysis."""
+    last = df.iloc[-1]
+    rsi = float(last["RSI"]) if not pd.isna(last["RSI"]) else 0
+    ema_trend = _get_ema_trend(df, signal['direction'])
+    rsi_interp = _get_rsi_interpretation(rsi)
+    atr_strength = _get_atr_strength(df)
+    candle_strength = _get_candle_strength(df)
+    
+    return (
+        f"🎲 *MARTINGALE PRE-ALERT*\n\n"
         f"Pair: {signal['pair']}\n"
         f"Direction: {signal['direction']}\n"
-        f"Entry time: {signal['martingale_time']:%H:%M}\n"
+        f"Time: {signal['martingale_time']:%H:%M}\n\n"
+        f"Confidence: {confidence}%\n\n"
+        f"*Technical Analysis*\n"
+        f"EMA Trend: {ema_trend}\n"
+        f"RSI: {rsi:.0f} ({rsi_interp})\n"
+        f"ATR: {atr_strength}\n"
+        f"Candle Strength: {candle_strength}\n\n"
+        f"Status: Ready for martingale entry"
+    )
+
+
+def _build_mg_confirm_message(signal: dict, confidence: int, expiry: datetime, tp: float, sl: float, df: pd.DataFrame) -> str:
+    """Build martingale confirmed message with indicator analysis."""
+    last = df.iloc[-1]
+    rsi = float(last["RSI"]) if not pd.isna(last["RSI"]) else 0
+    ema_trend = _get_ema_trend(df, signal['direction'])
+    rsi_interp = _get_rsi_interpretation(rsi)
+    atr_strength = _get_atr_strength(df)
+    candle_strength = _get_candle_strength(df)
+    
+    return (
+        f"🎲 *MARTINGALE CONFIRMED*\n\n"
+        f"Pair: {signal['pair']}\n"
+        f"Direction: {signal['direction']}\n\n"
+        f"Confidence: {confidence}%\n\n"
+        f"*Technical Analysis*\n"
+        f"EMA Trend: {ema_trend}\n"
+        f"RSI: {rsi:.0f} ({rsi_interp})\n"
+        f"ATR: {atr_strength}\n"
+        f"Candle Strength: {candle_strength}\n\n"
+        f"*Trade Details*\n"
+        f"Entry Time: {signal['martingale_time']:%H:%M}\n"
         f"Expiry: {expiry:%H:%M}\n"
-        f"Confidence: {confidence}%\n"
-        f"Forex TP: {tp}\n"
-        f"Forex SL: {sl}"
+        f"TP: {tp}\n"
+        f"SL: {sl}\n\n"
+        f"Decision: ENTERING MARTINGALE ✅"
     )
+
+
+def _format_result_message(entry: dict) -> str:
+    """Format result message for a finished trade."""
+    pair = entry.get("pair", "EURUSD")
+    direction = entry.get("direction")
+    entry_price = entry.get("entry_price")
+    final_price = entry.get("final_price")
+    result = entry.get("result")
+
+    outcome = "✅ WIN" if result == "WIN" else "❌ LOSS"
+
+    return (
+        f"📊 RESULT\n\n"
+        f"Pair: {pair}\n"
+        f"Direction: {direction}\n\n"
+        f"Entry: {entry_price:.5f}\n"
+        f"Exit: {final_price:.5f}\n\n"
+        f"Result: {outcome}"
+    )
+
+
+def _update_stats(entry: dict):
+    """Update global stats based on a finished trade."""
+    global total_trades, wins, losses
+    total_trades += 1
+    if entry.get("result") == "WIN":
+        wins += 1
+    else:
+        losses += 1
 
 
 def process_signal_list(
@@ -479,12 +805,59 @@ def process_signal_list(
     minute_data_fetcher: Optional[Callable[[], Optional[pd.DataFrame]]] = None,
 ) -> List[str]:
     global signal_list, processed_signals, evaluated_signal_count, confirmed_signal_count
+    global tracked_signals, total_trades, wins, losses
 
     if df is None or len(df) < 200:
         return []
 
     now = _now()
     messages: List[str] = []
+
+    daily_report = _maybe_build_daily_report(now)
+    if daily_report:
+        messages.append(daily_report)
+
+    # 1) Check for any tracked signals that have expired and report results
+    try:
+        for entry in list(tracked_signals):
+            if entry.get("resolved"):
+                continue
+            expiry = entry.get("expiry_time")
+            if expiry is None:
+                continue
+            if expiry <= now:
+                # need latest 1min data to determine final price
+                final_df = None
+                if minute_data_fetcher is not None:
+                    try:
+                        temp = minute_data_fetcher()
+                        if temp is not None and len(temp) >= 1:
+                            final_df = temp
+                    except Exception:
+                        final_df = None
+
+                if final_df is None:
+                    # cannot determine result without latest 1min data; skip for now
+                    continue
+
+                final_price = float(final_df.iloc[-1]["Close"])
+                entry_price = float(entry.get("entry_price"))
+                direction = entry.get("direction")
+
+                if _is_trade_direction(direction):
+                    is_win = final_price > entry_price
+                else:
+                    is_win = final_price < entry_price
+
+                entry["final_price"] = final_price
+                entry["resolved"] = True
+                entry["result"] = "WIN" if is_win else "LOSS"
+
+                # update stats and prepare message
+                _update_stats(entry)
+                messages.append(_format_result_message(entry))
+    except Exception as e:
+        print(f"Result tracking error: {e}")
 
     for signal in signal_list:
         try:
@@ -497,12 +870,21 @@ def process_signal_list(
                 continue
 
             base_key = _signal_key(signal_time, direction)
-            confidence = calculate_confidence(df, direction)
+
+            # Use fresh 1-minute data for PRE-SIGNAL confidence when available
+            pre_df = df
+            if minute_data_fetcher is not None:
+                temp_df = minute_data_fetcher()
+                if temp_df is not None and len(temp_df) >= 200:
+                    temp_df = add_indicators(temp_df)
+                    pre_df = temp_df
+
+            confidence = calculate_confidence(pre_df, direction)
 
             seconds_to_entry = (signal_time - now).total_seconds()
             if PRE_SIGNAL_MIN_SECONDS <= seconds_to_entry <= PRE_SIGNAL_MAX_SECONDS and not signal.get("pre_sent"):
-                if confidence >= 60:
-                    messages.append(_build_pre_message(signal, confidence))
+                if confidence >= 70:
+                    messages.append(_build_pre_message(signal, confidence, pre_df))
                     signal["pre_sent"] = True
 
             if abs((now - signal_time).total_seconds()) <= SIGNAL_WINDOW_SECONDS:
@@ -525,7 +907,22 @@ def process_signal_list(
                 if should_take:
                     _, tp, sl = build_forex_targets(signal_df, direction, confidence)
                     expiry = signal_time + timedelta(minutes=5)
-                    messages.append(_build_confirm_message(signal, confidence, expiry, tp, sl))
+                    messages.append(_build_confirm_message(signal, confidence, expiry, tp, sl, signal_df))
+                    # Store confirmed signal for result tracking
+                    try:
+                        entry_price = float(signal_df.iloc[-1]["Close"])
+                        store_tracked_signal(
+                            signal_time=signal_time,
+                            direction=direction,
+                            entry_price=entry_price,
+                            expiry_time=expiry,
+                            signal_type="direct",
+                            pair=signal.get("pair", "EURUSD"),
+                            confidence=confidence,
+                            df=signal_df,
+                        )
+                    except Exception:
+                        pass
                     signal["confirmed_sent"] = True
                     signal["martingale_confidence"] = confidence
                     confirmed_signal_count += 1
@@ -548,7 +945,7 @@ def process_signal_list(
                 if _is_strong_martingale(df, direction):
                     mg_confidence = calculate_confidence(df, direction)
                     signal["martingale_confidence"] = mg_confidence
-                    messages.append(_build_mg_pre_message(signal, mg_confidence))
+                    messages.append(_build_mg_pre_message(signal, mg_confidence, df))
                     signal["martingale_prealert_sent"] = True
 
             if abs((now - mg_time).total_seconds()) <= SIGNAL_WINDOW_SECONDS:
@@ -564,8 +961,24 @@ def process_signal_list(
                             expiry,
                             tp,
                             sl,
+                            df,
                         )
                     )
+                    # Store martingale confirmed signal
+                    try:
+                        entry_price = float(df.iloc[-1]["Close"])
+                        store_tracked_signal(
+                            signal_time=mg_time,
+                            direction=direction,
+                            entry_price=entry_price,
+                            expiry_time=expiry,
+                            signal_type="martingale",
+                            pair=signal.get("pair", "EURUSD"),
+                            confidence=mg_confidence,
+                            df=df,
+                        )
+                    except Exception:
+                        pass
                     processed_signals.add(mg_key)
                     signal["martingale_confirmed_sent"] = True
                     print(f"Signal confirmed: {mg_time:%H:%M} {direction}")
