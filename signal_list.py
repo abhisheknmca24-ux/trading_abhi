@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
+import json
+import os
 import re
 from typing import Callable, List, Optional
 
@@ -323,10 +325,14 @@ def calculate_confidence(df: pd.DataFrame, direction: str) -> int:
 
     # RSI Movement: +15
     if direction == "CALL":
-        if last["RSI"] > prev["RSI"]:
+        rsi = float(last["RSI"])
+        rsi_prev = float(prev["RSI"])
+        if rsi > 55 and rsi > rsi_prev:
             score += 15
     else:
-        if last["RSI"] < prev["RSI"]:
+        rsi = float(last["RSI"])
+        rsi_prev = float(prev["RSI"])
+        if rsi < 45 and rsi < rsi_prev:
             score += 15
 
     # ATR Strength: +15
@@ -341,9 +347,9 @@ def calculate_confidence(df: pd.DataFrame, direction: str) -> int:
     if distance <= max(0.0003, atr * 0.50):
         score += 10
 
-    # Score now maxes at 75 based on weights above; scale to percentage and cap at 95%
-    confidence = int((score / 75) * 100)
-    return min(confidence, 95)
+    # Score now maxes at 75 based on weights above; scale to percentage and cap at 90%
+    confidence = int((score / 75) * 85)
+    return min(confidence, 90)
 
 
 def build_forex_targets(df: pd.DataFrame, direction: str, confidence: int) -> tuple[float, float, float]:
@@ -519,13 +525,20 @@ def _check_safety_rules(df: pd.DataFrame, direction: str, confidence: int) -> tu
     atr_mean = float(df["ATR"].mean())
     trend_gap = abs(float(last["EMA50"]) - float(last["EMA200"]))
     trend_threshold = max(0.0002, atr * 0.15)
+    rsi_value = float(last["RSI"])
+
+    # Overbought/Oversold protection
+    if direction == "CALL" and rsi_value >= 68:
+        return False, "RSI overbought, reject CALL"
+    if direction == "PUT" and rsi_value <= 32:
+        return False, "RSI oversold, reject PUT"
 
     if direction == "CALL":
         trend_direction_ok = float(last["EMA50"]) > float(last["EMA200"])
-        rsi_opposite_extreme = float(last["RSI"]) < 35
+        rsi_opposite_extreme = rsi_value < 35
     else:
         trend_direction_ok = float(last["EMA50"]) < float(last["EMA200"])
-        rsi_opposite_extreme = float(last["RSI"]) > 65
+        rsi_opposite_extreme = rsi_value > 65
 
     if not trend_direction_ok or trend_gap <= trend_threshold:
         return False, "trend unclear"
@@ -533,9 +546,9 @@ def _check_safety_rules(df: pd.DataFrame, direction: str, confidence: int) -> tu
     if rsi_opposite_extreme:
         return False, "RSI extreme opposite"
 
-    if direction == "CALL" and float(last["RSI"]) < 55:
+    if direction == "CALL" and rsi_value < 55:
         return False, "RSI weak zone"
-    if direction == "PUT" and float(last["RSI"]) > 45:
+    if direction == "PUT" and rsi_value > 45:
         return False, "RSI weak zone"
 
     if atr <= atr_mean:
@@ -649,6 +662,44 @@ def get_adaptive_trade_threshold(base_threshold: int = 70) -> int:
     return base_threshold
 
 
+def _save_tracked_signals_to_json() -> None:
+    """Save tracked_signals to JSON file for persistence across restarts."""
+    try:
+        json_data = []
+        for signal in tracked_signals:
+            data = dict(signal)
+            # Convert datetime objects to ISO format strings
+            if "signal_time" in data and isinstance(data["signal_time"], datetime):
+                data["signal_time"] = data["signal_time"].isoformat()
+            if "expiry_time" in data and isinstance(data["expiry_time"], datetime):
+                data["expiry_time"] = data["expiry_time"].isoformat()
+            json_data.append(data)
+        
+        with open("tracked_signals.json", "w") as f:
+            json.dump(json_data, f, indent=2)
+    except Exception as e:
+        print(f"Error saving tracked signals to JSON: {e}")
+
+
+def _load_tracked_signals_from_json() -> None:
+    """Load tracked_signals from JSON file on startup."""
+    global tracked_signals
+    try:
+        if os.path.exists("tracked_signals.json"):
+            with open("tracked_signals.json", "r") as f:
+                json_data = json.load(f)
+                for data in json_data:
+                    # Convert ISO format strings back to datetime objects
+                    if "signal_time" in data and isinstance(data["signal_time"], str):
+                        data["signal_time"] = datetime.fromisoformat(data["signal_time"])
+                    if "expiry_time" in data and isinstance(data["expiry_time"], str):
+                        data["expiry_time"] = datetime.fromisoformat(data["expiry_time"])
+                    tracked_signals.append(data)
+            print(f"Loaded {len(tracked_signals)} tracked signals from JSON")
+    except Exception as e:
+        print(f"Error loading tracked signals from JSON: {e}")
+
+
 def store_tracked_signal(
     signal_time: datetime,
     direction: str,
@@ -678,6 +729,10 @@ def store_tracked_signal(
     # Memory management: keep only last 200 trades
     if len(tracked_signals) > 200:
         tracked_signals[:] = tracked_signals[-200:]
+    
+    # Save to JSON for persistence
+    _save_tracked_signals_to_json()
+
 
 
 def _build_performance_report() -> str:
@@ -818,6 +873,11 @@ def process_signal_list(
     global signal_list, processed_signals, evaluated_signal_count, confirmed_signal_count
     global tracked_signals, total_trades, wins, losses
 
+    # Load tracked signals from JSON on first call
+    if not hasattr(process_signal_list, "_initialized"):
+        _load_tracked_signals_from_json()
+        process_signal_list._initialized = True
+
     if df is None or len(df) < 200:
         return []
 
@@ -877,6 +937,9 @@ def process_signal_list(
                 # update stats and prepare message
                 _update_stats(entry)
                 messages.append(_format_result_message(entry))
+                
+                # Save updated tracked signals to JSON
+                _save_tracked_signals_to_json()
     except Exception as e:
         print(f"Result tracking error: {e}")
 
@@ -919,8 +982,7 @@ def process_signal_list(
                 signal_df = minute_df
 
                 if signal_df is None or len(signal_df) < 200:
-                    # Silent skip for this cycle when exact 1min data is unavailable.
-                    continue
+                    signal_df = df
 
                 # Use any pre-calculated confidence if present so pre-signal and confirmation match.
                 pre_conf = signal.get("pre_confidence")
@@ -933,7 +995,8 @@ def process_signal_list(
                 # Debug log final confidence used for decision
                 print(f"FINAL CONFIDENCE USED: {confidence}%")
 
-                should_take, _ = _should_take_signal(signal_df, direction, confidence, is_next_signal)
+                # Re-check safety rules at confirmation time - if market weakens, skip confirmation
+                should_take, skip_reason = _should_take_signal(signal_df, direction, confidence, is_next_signal)
 
                 if should_take:
                     _, tp, sl = build_forex_targets(signal_df, direction, confidence)
@@ -958,6 +1021,9 @@ def process_signal_list(
                     signal["martingale_confidence"] = confidence
                     confirmed_signal_count += 1
                     print(f"Signal confirmed: {signal_time:%H:%M} {direction}")
+                else:
+                    # Market weakened between pre-signal and confirmation - skip safely
+                    print(f"Skipping confirmation for {signal_time:%H:%M} {direction}: {skip_reason}")
 
                 processed_signals.add(base_key)
                 evaluated_signal_count += 1
