@@ -10,6 +10,16 @@ from typing import Callable, List, Optional
 import pandas as pd
 
 from indicators import add_indicators
+from learning_engine import calculate_real_confidence
+from market_filters import (  # PHASE 6: Import market filtering functions
+    is_optimal_trading_session,
+    is_sideways_market,
+    detect_volatility_spike,
+    analyze_candle_wicks,
+    detect_volatility_instability,
+    check_market_quality,
+    generate_market_filter_report,
+)
 
 try:
     from zoneinfo import ZoneInfo
@@ -52,6 +62,12 @@ losses = 0
 last_daily_report_date = None
 
 
+# ==============================
+# PHASE 5: MARTINGALE SAFETY MANAGER
+# ==============================
+# Class definition moved after _now() function (see below)
+# Global safety manager will be initialized after helper functions
+
 def _get_timezone():
     if ZoneInfo is None:
         return None
@@ -63,6 +79,168 @@ def _now() -> datetime:
     if tz is None:
         return datetime.now()
     return datetime.now(tz)
+
+
+# Now we can define MartingaleSafetyManager after _now is available
+class MartingaleSafetyManager:
+    """Manages martingale safety constraints and daily limits."""
+    
+    def __init__(self):
+        self.daily_martingale_trades = 0
+        self.consecutive_losses = 0
+        self.last_two_trades = []  # Track last 2 trade results
+        self.daily_losses = 0
+        self.martingale_disabled_until = None
+        self.emergency_stop_active = False
+        self.last_reset_date = _now().date()
+        
+        # PHASE 5 constraints
+        self.MIN_CONFIDENCE_FOR_MARTINGALE = 80
+        self.MAX_DAILY_MARTINGALE_TRADES = 2
+        self.MAX_CONSECUTIVE_LOSSES = 2
+        self.CONSECUTIVE_LOSS_DISABLE_MINUTES = 30
+        self.MAX_DAILY_LOSSES = 3
+        self.ATR_STRENGTH_MULTIPLIER = 1.2  # ATR > mean * 1.2
+        self.VOLATILITY_SPIKE_MULTIPLIER = 2.0  # ATR > mean * 2.0
+        self.SESSION_OPENING_MINUTES = 15  # Disable first 15 mins after market open
+    
+    def _reset_daily_counters(self):
+        """Reset daily counters if date has changed."""
+        today = _now().date()
+        if today != self.last_reset_date:
+            self.daily_martingale_trades = 0
+            self.daily_losses = 0
+            self.emergency_stop_active = False
+            self.last_reset_date = today
+    
+    def update_from_tracked_signals(self):
+        """Update state from tracked signals (called before each decision)."""
+        self._reset_daily_counters()
+        
+        # Get today's trades
+        now = _now()
+        today = now.date()
+        today_trades = [
+            t for t in tracked_signals 
+            if t.get("resolved") and t.get("signal_time") is not None
+            and (t["signal_time"].date() if hasattr(t["signal_time"], 'date') else pd.Timestamp(t["signal_time"]).date()) == today
+        ]
+        
+        # Count martingale trades and losses today
+        self.daily_martingale_trades = sum(
+            1 for t in today_trades 
+            if t.get("source") == "Martingale"
+        )
+        self.daily_losses = sum(
+            1 for t in today_trades 
+            if t.get("result") == "LOSS"
+        )
+        
+        # Track consecutive losses (from last 2 trades)
+        self.last_two_trades = [
+            t for t in sorted(tracked_signals, key=lambda x: x.get("signal_time", datetime.min), reverse=True)
+            if t.get("resolved")
+        ][:2]
+        
+        self.consecutive_losses = sum(
+            1 for t in self.last_two_trades 
+            if t.get("result") == "LOSS"
+        )
+        
+        # Check emergency stop
+        if self.daily_losses >= self.MAX_DAILY_LOSSES:
+            self.emergency_stop_active = True
+        
+        # Check temporary martingale disable
+        if self.consecutive_losses >= self.MAX_CONSECUTIVE_LOSSES:
+            if self.martingale_disabled_until is None:
+                self.martingale_disabled_until = now + timedelta(
+                    minutes=self.CONSECUTIVE_LOSS_DISABLE_MINUTES
+                )
+        elif self.martingale_disabled_until is not None and now > self.martingale_disabled_until:
+            self.martingale_disabled_until = None
+    
+    def is_martingale_allowed(self) -> tuple[bool, str]:
+        """Check if martingale trading is currently allowed."""
+        self.update_from_tracked_signals()
+        
+        # Emergency stop overrides everything
+        if self.emergency_stop_active:
+            return False, "🛑 EMERGENCY STOP: Daily loss limit reached"
+        
+        # Daily martingale trade limit
+        if self.daily_martingale_trades >= self.MAX_DAILY_MARTINGALE_TRADES:
+            return False, f"Daily martingale limit reached ({self.daily_martingale_trades}/{self.MAX_DAILY_MARTINGALE_TRADES})"
+        
+        # Temporary disable from consecutive losses
+        if self.martingale_disabled_until is not None:
+            now = _now()
+            if now < self.martingale_disabled_until:
+                mins_remaining = int((self.martingale_disabled_until - now).total_seconds() / 60)
+                return False, f"Martingale disabled temporarily (consecutive losses): {mins_remaining}m remaining"
+            else:
+                self.martingale_disabled_until = None
+        
+        return True, "Martingale allowed"
+    
+    def check_volatility_conditions(self, df: pd.DataFrame) -> tuple[bool, str]:
+        """Check volatility and trend conditions for martingale."""
+        if df is None or len(df) < 50:
+            return False, "Insufficient data"
+        
+        last = df.iloc[-1]
+        atr = float(last["ATR"]) if not pd.isna(last.get("ATR")) else 0
+        atr_mean = float(df["ATR"].tail(20).mean()) if not pd.isna(df["ATR"].tail(20).mean()) else 0
+        trend_strength = float(last["TrendStrength"]) if not pd.isna(last.get("TrendStrength")) else 0
+        
+        # Check for volatility spike (disable martingale)
+        if atr > atr_mean * self.VOLATILITY_SPIKE_MULTIPLIER:
+            return False, f"Volatility spike detected (ATR: {atr:.6f} > {atr_mean * self.VOLATILITY_SPIKE_MULTIPLIER:.6f})"
+        
+        # Check for strong ATR
+        if atr <= atr_mean * self.ATR_STRENGTH_MULTIPLIER:
+            return False, f"ATR not strong enough ({atr:.6f} <= {atr_mean * self.ATR_STRENGTH_MULTIPLIER:.6f})"
+        
+        # Check for strong EMA slope (trend strength)
+        min_trend_strength = max(0.0002, atr_mean * 0.25)
+        if trend_strength < min_trend_strength:
+            return False, f"EMA slope too weak (TrendStrength: {trend_strength:.6f} < {min_trend_strength:.6f})"
+        
+        return True, "Volatility conditions passed"
+    
+    def check_session_timing(self) -> tuple[bool, str]:
+        """Check if trading is near market opening."""
+        now = _now()
+        market_open = now.replace(hour=13, minute=30, second=0, microsecond=0)
+        
+        # If we're after market open but close to it
+        if now > market_open:
+            time_since_open = (now - market_open).total_seconds() / 60
+            if time_since_open < self.SESSION_OPENING_MINUTES:
+                return False, f"Too close to session opening ({time_since_open:.0f}m < {self.SESSION_OPENING_MINUTES}m)"
+        
+        return True, "Session timing OK"
+    
+    def get_status_report(self) -> str:
+        """Get current martingale safety status."""
+        self.update_from_tracked_signals()
+        
+        status = f"""
+🎲 MARTINGALE SAFETY STATUS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Daily Martingale Trades: {self.daily_martingale_trades}/{self.MAX_DAILY_MARTINGALE_TRADES}
+Consecutive Losses: {self.consecutive_losses}/{self.MAX_CONSECUTIVE_LOSSES}
+Daily Losses: {self.daily_losses}/{self.MAX_DAILY_LOSSES}
+
+Emergency Stop: {'🛑 ACTIVE' if self.emergency_stop_active else '✅ OFF'}
+Temporary Disable: {'⏳ ACTIVE' if self.martingale_disabled_until else '✅ OFF'}
+        """.strip()
+        return status
+
+
+# Global safety manager instance (initialized after class definition and helper functions)
+_martingale_safety_manager = MartingaleSafetyManager()
+
 
 
 def _signal_key(signal_time: datetime, direction: str) -> str:
@@ -226,6 +404,315 @@ def should_force_fast_mode(now: Optional[datetime] = None, window_seconds: int =
 
     return False
 
+# ============================================================================
+# PHASE 2: STRONGER RSI ENGINE - Helper Functions
+# ============================================================================
+
+def _check_rsi_momentum(df, direction: str, min_candles: int = 2) -> bool:
+    """Check if RSI momentum is in correct direction for min_candles."""
+    if df is None or len(df) < min_candles + 1:
+        return False
+    try:
+        rsi_values = df["RSI"].tail(min_candles + 1).values
+        if len(rsi_values) < min_candles + 1:
+            return False
+        if direction == "CALL":
+            for i in range(1, len(rsi_values)):
+                if rsi_values[i] < rsi_values[i - 1]:
+                    return False
+            return True
+        else:  # PUT
+            for i in range(1, len(rsi_values)):
+                if rsi_values[i] > rsi_values[i - 1]:
+                    return False
+            return True
+    except Exception:
+        return False
+
+
+def _check_rsi_divergence(df, direction: str, lookback: int = 5) -> bool:
+    """Detect price/RSI divergence. Returns True if no divergence (safe)."""
+    if df is None or len(df) < lookback + 1:
+        return True
+    try:
+        df_lookback = df.tail(lookback + 1)
+        closes = df_lookback["Close"].values
+        rsis = df_lookback["RSI"].values
+        price_high_idx = closes.argmax()
+        price_low_idx = closes.argmin()
+        rsi_high_idx = rsis.argmax()
+        rsi_low_idx = rsis.argmin()
+        if direction == "CALL":
+            if price_high_idx > rsi_high_idx:
+                if rsis[price_high_idx] < rsis[rsi_high_idx]:
+                    return False
+        else:  # PUT
+            if price_low_idx > rsi_low_idx:
+                if rsis[price_low_idx] > rsis[rsi_low_idx]:
+                    return False
+        return True
+    except Exception:
+        return True
+
+
+def _get_rsi_strength_zone(rsi: float, direction: str) -> str:
+    """Classify RSI into strength zones."""
+    if direction == "CALL":
+        if rsi >= 65:
+            return "STRONG_CALL"
+        elif rsi >= 58:
+            return "ACCEPTABLE_CALL"
+        else:
+            return "WEAK_CALL"
+    else:  # PUT
+        if rsi <= 35:
+            return "STRONG_PUT"
+        elif rsi <= 42:
+            return "ACCEPTABLE_PUT"
+        else:
+            return "WEAK_PUT"
+
+
+def _check_ema_trend_strength(df: pd.DataFrame, direction: str, min_continuation_candles: int = 2) -> tuple[bool, str]:
+    """Validate EMA slope, acceleration, continuation, and exhaustion."""
+    if df is None or len(df) < max(5, min_continuation_candles + 2):
+        return False, "insufficient data"
+
+    try:
+        df = add_indicators(df)
+        last = df.iloc[-1]
+        prev = df.iloc[-2]
+        prev2 = df.iloc[-3]
+
+        required_values = [
+            last["EMA50"],
+            last["EMA200"],
+            prev["EMA50"],
+            prev2["EMA50"],
+            last["Close"],
+            last["Open"],
+        ]
+        if any(pd.isna(value) for value in required_values):
+            return False, "indicator values unavailable"
+
+        atr = float(last["ATR"]) if not pd.isna(last.get("ATR")) else 0.0
+        ema_now = float(last["EMA50"])
+        ema_prev = float(prev["EMA50"])
+        ema_prev2 = float(prev2["EMA50"])
+        ema200_now = float(last["EMA200"])
+        slope_now = ema_now - ema_prev
+        slope_prev = ema_prev - ema_prev2
+        acceleration = slope_now - slope_prev
+
+        last_close = float(last["Close"])
+        last_open = float(last["Open"])
+        prev_close = float(prev["Close"])
+        prev_open = float(prev["Open"])
+        last_body = abs(last_close - last_open)
+        avg_body = float((df["Close"] - df["Open"]).abs().tail(10).mean())
+
+        slope_threshold = max(0.00005, atr * 0.03)
+        flat_threshold = max(0.00008, atr * 0.04)
+        spike_threshold = max(avg_body * 2.0, atr * 0.8)
+
+        if abs(slope_now) < flat_threshold:
+            return False, "EMA flat market"
+
+        if direction == "CALL":
+            continuation_ok = last_close > last_open and prev_close > prev_open
+            if ema_now <= ema_prev or ema_prev <= ema_prev2:
+                return False, "EMA50 not rising"
+            if slope_now < slope_threshold:
+                return False, "EMA slope weak"
+            if acceleration <= 0:
+                return False, "EMA acceleration weak"
+            if not continuation_ok:
+                return False, "bullish continuation weak"
+            if last_body >= spike_threshold and slope_now <= slope_prev:
+                return False, "trend exhaustion"
+            if ema_now <= ema200_now:
+                return False, "EMA trend not bullish"
+        else:
+            continuation_ok = last_close < last_open and prev_close < prev_open
+            if ema_now >= ema_prev or ema_prev >= ema_prev2:
+                return False, "EMA50 not falling"
+            if abs(slope_now) < slope_threshold:
+                return False, "EMA slope weak"
+            if acceleration >= 0:
+                return False, "EMA acceleration weak"
+            if not continuation_ok:
+                return False, "bearish continuation weak"
+            if last_body >= spike_threshold and slope_now >= slope_prev:
+                return False, "trend exhaustion"
+            if ema_now >= ema200_now:
+                return False, "EMA trend not bearish"
+
+        return True, "EMA trend strength passed"
+    except Exception:
+        return False, "EMA trend check failed"
+
+
+# ============================================================================
+# PHASE 7: CONFIRMATION IMPROVEMENTS - Re-check before entry
+# ============================================================================
+
+def _revalidate_confirmation_conditions(df: pd.DataFrame, direction: str) -> tuple[bool, str]:
+    """
+    PHASE 7: Re-validate critical conditions at confirmation time.
+    Checks: RSI, ATR, EMA slope, candle strength
+    Returns: (valid, reason)
+    """
+    if df is None or len(df) < 200:
+        return False, "insufficient data for revalidation"
+    
+    try:
+        df = add_indicators(df)
+        last = df.iloc[-1]
+        prev = df.iloc[-2]
+        
+        # Re-check RSI (must still be moving in correct direction)
+        rsi = float(last["RSI"]) if not pd.isna(last.get("RSI")) else 0
+        rsi_prev = float(prev["RSI"]) if not pd.isna(prev.get("RSI")) else 0
+        
+        if direction == "CALL":
+            if rsi <= rsi_prev:
+                return False, f"RSI not rising at confirmation ({rsi:.1f} <= {rsi_prev:.1f})"
+            if rsi < 55:
+                return False, f"RSI too low for CALL confirmation ({rsi:.1f} < 55)"
+        else:  # PUT
+            if rsi >= rsi_prev:
+                return False, f"RSI not falling at confirmation ({rsi:.1f} >= {rsi_prev:.1f})"
+            if rsi > 45:
+                return False, f"RSI too high for PUT confirmation ({rsi:.1f} > 45)"
+        
+        # Re-check ATR (must be strong)
+        atr = float(last["ATR"]) if not pd.isna(last.get("ATR")) else 0
+        atr_mean_20 = float(df["ATR"].tail(20).mean()) if not pd.isna(df["ATR"].tail(20).mean()) else 0
+        
+        if atr <= atr_mean_20:
+            return False, f"ATR weakened at confirmation ({atr:.6f} <= mean {atr_mean_20:.6f})"
+        
+        # Re-check EMA slope (must still have strong slope)
+        ema50 = float(last["EMA50"]) if not pd.isna(last.get("EMA50")) else 0
+        ema50_prev = float(df.iloc[-3]["EMA50"]) if len(df) > 2 and not pd.isna(df.iloc[-3].get("EMA50")) else 0
+        ema200 = float(last["EMA200"]) if not pd.isna(last.get("EMA200")) else 0
+        
+        slope = ema50 - ema50_prev
+        slope_threshold = atr * 0.05
+        
+        if direction == "CALL":
+            if slope <= 0:
+                return False, f"EMA50 slope negative for CALL confirmation (slope: {slope:.8f})"
+            if abs(slope) < slope_threshold * 0.5:
+                return False, f"EMA50 slope too weak for CALL ({abs(slope):.8f} < threshold {slope_threshold*0.5:.8f})"
+            if ema50 <= ema200:
+                return False, "EMA50 <= EMA200 at confirmation (lost bullish alignment)"
+        else:  # PUT
+            if slope >= 0:
+                return False, f"EMA50 slope positive for PUT confirmation (slope: {slope:.8f})"
+            if abs(slope) < slope_threshold * 0.5:
+                return False, f"EMA50 slope too weak for PUT ({abs(slope):.8f} < threshold {slope_threshold*0.5:.8f})"
+            if ema50 >= ema200:
+                return False, "EMA50 >= EMA200 at confirmation (lost bearish alignment)"
+        
+        # Re-check candle strength (current candle must be strong)
+        open_price = float(last["Open"]) if not pd.isna(last.get("Open")) else 0
+        close_price = float(last["Close"]) if not pd.isna(last.get("Close")) else 0
+        candle_size = abs(close_price - open_price)
+        avg_candle_20 = float((df["Close"] - df["Open"]).abs().tail(20).mean())
+        
+        if candle_size <= avg_candle_20 * 0.8:
+            return False, f"candle strength weakened ({candle_size:.6f} <= avg {avg_candle_20*0.8:.6f})"
+        
+        if direction == "CALL":
+            if close_price <= open_price:
+                return False, "CALL candle body broken (Close <= Open)"
+        else:  # PUT
+            if close_price >= open_price:
+                return False, "PUT candle body broken (Close >= Open)"
+        
+        return True, "✅ Confirmation conditions revalidated: RSI, ATR, EMA, candle strength all strong"
+        
+    except Exception as e:
+        return False, f"revalidation error: {str(e)}"
+
+
+def _check_micro_momentum_1m(minute_df: pd.DataFrame, direction: str) -> tuple[bool, str]:
+    """
+    PHASE 7: Check micro-momentum using 1-minute candles.
+    Analyzes recent 1-minute price action for sustained momentum.
+    Returns: (momentum_ok, reason)
+    """
+    if minute_df is None or len(minute_df) < 10:
+        return True, "1m data unavailable, skipping micro momentum check"
+    
+    try:
+        minute_df = add_indicators(minute_df)
+        
+        # Get last 5-10 1-minute candles
+        recent_1m = minute_df.tail(10)
+        
+        # Check for consistent direction movement
+        closes = recent_1m["Close"].values
+        opens = recent_1m["Open"].values
+        rsis_1m = recent_1m["RSI"].values if "RSI" in recent_1m.columns else None
+        
+        # Count how many candles moved in the correct direction
+        if direction == "CALL":
+            bullish_candles = sum(1 for i in range(len(closes)) if closes[i] > opens[i])
+            bullish_ratio = bullish_candles / len(closes)
+            
+            # Must have at least 50% bullish candles in last 10 1m candles
+            if bullish_ratio < 0.5:
+                return False, f"Micro momentum weak for CALL: only {bullish_ratio*100:.0f}% bullish 1m candles"
+            
+            # Check RSI on 1m if available - should be rising
+            if rsis_1m is not None and len(rsis_1m) >= 2:
+                recent_rsi_1m = rsis_1m[-1]
+                prev_rsi_1m = rsis_1m[-2]
+                if recent_rsi_1m <= prev_rsi_1m and recent_rsi_1m < 60:
+                    return False, f"1m RSI momentum weakening for CALL ({recent_rsi_1m:.1f} <= {prev_rsi_1m:.1f})"
+            
+            return True, f"✅ 1m micro-momentum strong for CALL ({bullish_ratio*100:.0f}% bullish candles)"
+            
+        else:  # PUT
+            bearish_candles = sum(1 for i in range(len(closes)) if closes[i] < opens[i])
+            bearish_ratio = bearish_candles / len(closes)
+            
+            # Must have at least 50% bearish candles in last 10 1m candles
+            if bearish_ratio < 0.5:
+                return False, f"Micro momentum weak for PUT: only {bearish_ratio*100:.0f}% bearish 1m candles"
+            
+            # Check RSI on 1m if available - should be falling
+            if rsis_1m is not None and len(rsis_1m) >= 2:
+                recent_rsi_1m = rsis_1m[-1]
+                prev_rsi_1m = rsis_1m[-2]
+                if recent_rsi_1m >= prev_rsi_1m and recent_rsi_1m > 40:
+                    return False, f"1m RSI momentum weakening for PUT ({recent_rsi_1m:.1f} >= {prev_rsi_1m:.1f})"
+            
+            return True, f"✅ 1m micro-momentum strong for PUT ({bearish_ratio*100:.0f}% bearish candles)"
+            
+    except Exception as e:
+        return True, f"1m momentum check error (non-blocking): {str(e)}"
+
+
+def _apply_phase7_confirmation_checks(df_5m: pd.DataFrame, df_1m: Optional[pd.DataFrame], direction: str) -> tuple[bool, str]:
+    """
+    PHASE 7: Apply all confirmation re-checks before entry.
+    Returns: (approved, reason)
+    """
+    # First: Re-validate on 5-minute candles
+    revalidate_ok, revalidate_msg = _revalidate_confirmation_conditions(df_5m, direction)
+    if not revalidate_ok:
+        return False, f"PHASE 7 rejection: {revalidate_msg}"
+    
+    # Second: Check micro-momentum on 1-minute candles
+    momentum_ok, momentum_msg = _check_micro_momentum_1m(df_1m, direction)
+    if not momentum_ok:
+        return False, f"PHASE 7 rejection: {momentum_msg}"
+    
+    return True, f"PHASE 7 confirmed: {revalidate_msg} → {momentum_msg}"
+
 
 def validate_sniper_signal(df: pd.DataFrame, direction: str) -> bool:
     if df is None or len(df) < 200:
@@ -252,22 +739,30 @@ def validate_sniper_signal(df: pd.DataFrame, direction: str) -> bool:
     avg_candle = (df["Close"] - df["Open"]).abs().tail(10).mean()
     distance = abs(float(last["Close"]) - float(last["EMA50"]))
 
-    trend_threshold = max(0.0002, atr * 0.15)
     ema_distance_threshold = max(0.0003, atr * 0.50)
 
-    if direction == "CALL":
-        trend_ok = last["EMA50"] > last["EMA200"]
-        rsi_ok = last["RSI"] > prev["RSI"]
-    else:
-        trend_ok = last["EMA50"] < last["EMA200"]
-        rsi_ok = last["RSI"] < prev["RSI"]
-
+    trend_ok, trend_reason = _check_ema_trend_strength(df, direction, min_continuation_candles=2)
     if not trend_ok:
         return False
-    if abs(float(last["EMA50"]) - float(last["EMA200"])) <= trend_threshold:
-        return False
+
+    if direction == "CALL":
+        rsi_ok = last["RSI"] > prev["RSI"]
+    else:
+        rsi_ok = last["RSI"] < prev["RSI"]
+
     if not rsi_ok:
         return False
+    
+    # PHASE 2: Add momentum check (2-3 candles minimum)
+    momentum_ok = _check_rsi_momentum(df, direction, min_candles=2)
+    if not momentum_ok:
+        return False
+    
+    # PHASE 2: Add divergence check
+    no_divergence = _check_rsi_divergence(df, direction, lookback=5)
+    if not no_divergence:
+        return False
+    
     if atr <= atr_mean:
         return False
     if candle_size <= float(avg_candle):
@@ -275,33 +770,105 @@ def validate_sniper_signal(df: pd.DataFrame, direction: str) -> bool:
     if distance > ema_distance_threshold:
         return False
 
+    # PHASE 6: Market Quality Checks
+    sideways, _ = is_sideways_market(df, direction)
+    if sideways:
+        return False
+    
+    spike, _ = detect_volatility_spike(df)
+    if spike:
+        return False
+    
+    bad_wicks, _ = analyze_candle_wicks(df, direction)
+    if bad_wicks:
+        return False
+    
+    unstable, _ = detect_volatility_instability(df)
+    if unstable:
+        return False
+
     return True
 
 
-def validate_martingale_signal(df: pd.DataFrame, direction: str) -> bool:
+def validate_martingale_signal(df: pd.DataFrame, direction: str) -> tuple[bool, str]:
+    """PHASE 5: Enhanced martingale validation with comprehensive safety checks."""
+    
+    # First check: Is martingale allowed by safety manager?
+    allowed, reason = _martingale_safety_manager.is_martingale_allowed()
+    if not allowed:
+        return False, reason
+    
+    # Second check: Base sniper validation
     if not validate_sniper_signal(df, direction):
-        return False
+        return False, "sniper validation failed"
 
     df = add_indicators(df)
     last = df.iloc[-1]
     prev = df.iloc[-2]
-
+    
+    # Third check: Strong ATR requirement
+    atr = float(last["ATR"]) if not pd.isna(last.get("ATR")) else 0.0
+    atr_mean = float(df["ATR"].tail(20).mean()) if not pd.isna(df["ATR"].tail(20).mean()) else 0.0
+    
+    # Fourth check: RSI and candle momentum
     if direction == "CALL":
-        if last["RSI"] <= 60:
-            return False
+        if last["RSI"] < 58:
+            return False, "RSI < 58 for CALL"
         if last["RSI"] <= prev["RSI"]:
-            return False
+            return False, "RSI not rising for CALL"
         if float(last["Close"]) <= float(last["Open"]):
-            return False
+            return False, "Close <= Open for CALL"
     else:
-        if last["RSI"] >= 40:
-            return False
+        if last["RSI"] > 42:
+            return False, "RSI > 42 for PUT"
         if last["RSI"] >= prev["RSI"]:
-            return False
+            return False, "RSI not falling for PUT"
         if float(last["Close"]) >= float(last["Open"]):
-            return False
-
-    return True
+            return False, "Close >= Open for PUT"
+    
+    # Fifth check: Strong candle momentum
+    candle_size = abs(float(last["Close"]) - float(last["Open"]))
+    avg_candle = float((df["Close"] - df["Open"]).abs().tail(10).mean())
+    if candle_size <= avg_candle:
+        return False, f"candle momentum weak ({candle_size:.6f} <= {avg_candle:.6f})"
+    
+    # Sixth check: Volatility and ATR conditions
+    volatility_ok, volatility_reason = _martingale_safety_manager.check_volatility_conditions(df)
+    if not volatility_ok:
+        return False, volatility_reason
+    
+    # Seventh check: Session timing
+    session_ok, session_reason = _martingale_safety_manager.check_session_timing()
+    if not session_ok:
+        return False, session_reason
+    
+    # PHASE 6: Advanced Market Quality Checks for Martingale
+    # More strict: sideways market is strictly forbidden
+    sideways, sideways_msg = is_sideways_market(df, direction)
+    if sideways:
+        return False, f"Martingale blocked: {sideways_msg}"
+    
+    # Volatility spikes are forbidden for martingale
+    spike, spike_msg = detect_volatility_spike(df)
+    if spike:
+        return False, f"Martingale blocked: {spike_msg}"
+    
+    # Bad candle wicks are forbidden for martingale
+    bad_wicks, wick_msg = analyze_candle_wicks(df, direction)
+    if bad_wicks:
+        return False, f"Martingale blocked: {wick_msg}"
+    
+    # Volatility instability is forbidden for martingale
+    unstable, unstable_msg = detect_volatility_instability(df)
+    if unstable:
+        return False, f"Martingale blocked: {unstable_msg}"
+    
+    # Eighth check: Confidence must be >= 80
+    confidence = calculate_confidence(df, direction)
+    if confidence < _martingale_safety_manager.MIN_CONFIDENCE_FOR_MARTINGALE:
+        return False, f"confidence {confidence} < {_martingale_safety_manager.MIN_CONFIDENCE_FOR_MARTINGALE}"
+    
+    return True, "martingale validation passed"
 
 
 def calculate_confidence(df: pd.DataFrame, direction: str) -> int:
@@ -523,59 +1090,87 @@ def _check_safety_rules(df: pd.DataFrame, direction: str, confidence: int) -> tu
 
     atr = float(last["ATR"])
     atr_mean = float(df["ATR"].mean())
-    trend_gap = abs(float(last["EMA50"]) - float(last["EMA200"]))
-    trend_threshold = max(0.0002, atr * 0.15)
     rsi_value = float(last["RSI"])
 
-    # Overbought/Oversold protection
-    if direction == "CALL" and rsi_value >= 68:
-        return False, "RSI overbought, reject CALL"
-    if direction == "PUT" and rsi_value <= 32:
-        return False, "RSI oversold, reject PUT"
+    # Overbought/Oversold protection (PHASE 2 hard rejects)
+    if direction == "CALL" and rsi_value > 78:
+        return False, "RSI overbought (>78), reject CALL"
+    if direction == "PUT" and rsi_value < 22:
+        return False, "RSI oversold (<22), reject PUT"
+
+    trend_ok, trend_reason = _check_ema_trend_strength(df, direction, min_continuation_candles=2)
+    if not trend_ok:
+        return False, trend_reason
 
     if direction == "CALL":
-        trend_direction_ok = float(last["EMA50"]) > float(last["EMA200"])
-        rsi_opposite_extreme = rsi_value < 35
+        rsi_opposite_extreme = rsi_value < 30  # Stronger lower bound
     else:
-        trend_direction_ok = float(last["EMA50"]) < float(last["EMA200"])
-        rsi_opposite_extreme = rsi_value > 65
-
-    if not trend_direction_ok or trend_gap <= trend_threshold:
-        return False, "trend unclear"
+        rsi_opposite_extreme = rsi_value > 70  # Stronger upper bound
 
     if rsi_opposite_extreme:
         return False, "RSI extreme opposite"
 
-    if direction == "CALL" and rsi_value < 55:
-        return False, "RSI weak zone"
-    if direction == "PUT" and rsi_value > 45:
-        return False, "RSI weak zone"
+    # PHASE 2: Updated minimum thresholds
+    if direction == "CALL" and rsi_value < 58:
+        return False, "RSI weak zone (<58), reject CALL"
+    if direction == "PUT" and rsi_value > 42:
+        return False, "RSI weak zone (>42), reject PUT"
 
+    # PHASE 2: Add momentum and divergence checks
+    momentum_ok = _check_rsi_momentum(df, direction, min_candles=2)
+    if not momentum_ok:
+        return False, "RSI momentum weak"
+    
+    divergence_ok = _check_rsi_divergence(df, direction, lookback=5)
+    if not divergence_ok:
+        return False, "RSI divergence detected"
+    
     if atr <= atr_mean:
         return False, "low volatility"
 
     return True, "safety passed"
 
 
-def _is_strong_martingale(df: pd.DataFrame, direction: str) -> bool:
-    if not validate_martingale_signal(df, direction):
-        return False
+def _is_strong_martingale(df: pd.DataFrame, direction: str) -> tuple[bool, str]:
+    """PHASE 5: Check if martingale is valid with full safety checks."""
+    valid, reason = validate_martingale_signal(df, direction)
+    if not valid:
+        return False, reason
 
-    confidence = calculate_confidence(df, direction)
-    return confidence >= 75
+    last = df.iloc[-1]
+    confidence_result = calculate_real_confidence(
+        signal_time=last.get("CandleTime", None),
+        direction=direction,
+        rsi=float(last["RSI"]) if not pd.isna(last.get("RSI")) else None,
+        source="Martingale",
+        atr=float(last["ATR"]) if not pd.isna(last.get("ATR")) else None,
+        ema_slope=float(last["EMA50"]) - float(last["EMA200"]),
+        indicator_score=50.0,
+        min_historical_samples=10,
+    )
+    
+    if confidence_result["confidence"] >= 75:
+        return True, "strong martingale confirmed"
+    else:
+        return False, f"confidence {confidence_result['confidence']} < 75"
 
 
-def _should_take_signal(df: pd.DataFrame, direction: str, confidence: int, is_next_signal: bool) -> tuple[bool, str]:
+def _should_take_signal(df: pd.DataFrame, direction: str, confidence: int, is_next_signal: bool, minute_df: Optional[pd.DataFrame] = None) -> tuple[bool, str]:
     safety_ok, safety_reason = _check_safety_rules(df, direction, confidence)
     if not safety_ok:
         return False, safety_reason
+
+    # PHASE 7: Apply confirmation re-checks before entry
+    phase7_ok, phase7_reason = _apply_phase7_confirmation_checks(df, minute_df, direction)
+    if not phase7_ok:
+        return False, phase7_reason
 
     # First signal is strict: only high-confidence entries.
     base_threshold = 70 if is_next_signal else 75
     threshold = get_adaptive_trade_threshold(base_threshold)
 
     if confidence >= threshold:
-        return True, f"confidence >= {threshold}"
+        return True, f"confidence >= {threshold} + PHASE 7 confirmed"
 
     if is_next_signal:
         return False, f"next signal confidence below {threshold}"
@@ -709,6 +1304,7 @@ def store_tracked_signal(
     pair: str,
     confidence: float,
     df: pd.DataFrame,
+    source: str = "Regular",  # PHASE 5: Track source (Regular or Martingale)
 ) -> None:
     global tracked_signals
     last = df.iloc[-1]
@@ -723,6 +1319,7 @@ def store_tracked_signal(
         "rsi": float(last["RSI"]) if not pd.isna(last["RSI"]) else None,
         "atr": float(last["ATR"]) if not pd.isna(last["ATR"]) else None,
         "ema_trend": _get_ema_trend(df, direction),
+        "source": source,  # PHASE 5: Add source tracking
         "resolved": False,
     })
 
@@ -963,7 +1560,18 @@ def process_signal_list(
 
             # Prefer minute-level data for pre-signal calculation; fallback to provided df.
             pre_df = minute_df if (minute_df is not None and len(minute_df) >= 200) else df
-            pre_confidence = calculate_confidence(pre_df, direction)
+            pre_last = pre_df.iloc[-1]
+            pre_confidence_result = calculate_real_confidence(
+                signal_time=signal_time,
+                direction=direction,
+                rsi=float(pre_last["RSI"]) if not pd.isna(pre_last.get("RSI")) else None,
+                source=signal.get("source", "Signal List"),
+                atr=float(pre_last["ATR"]) if not pd.isna(pre_last.get("ATR")) else None,
+                ema_slope=float(pre_last["EMA50"]) - float(pre_last["EMA200"]),
+                indicator_score=50.0,
+                min_historical_samples=10,
+            )
+            pre_confidence = pre_confidence_result["confidence"]
 
             seconds_to_entry = (signal_time - now).total_seconds()
             if PRE_SIGNAL_MIN_SECONDS <= seconds_to_entry <= PRE_SIGNAL_MAX_SECONDS and not signal.get("pre_sent"):
@@ -990,13 +1598,25 @@ def process_signal_list(
                 if pre_conf is not None:
                     confidence = pre_conf
                 else:
-                    confidence = calculate_confidence(signal_df, direction)
+                    conf_last = signal_df.iloc[-1]
+                    confidence_result = calculate_real_confidence(
+                        signal_time=signal_time,
+                        direction=direction,
+                        rsi=float(conf_last["RSI"]) if not pd.isna(conf_last.get("RSI")) else None,
+                        source=signal.get("source", "Signal List"),
+                        atr=float(conf_last["ATR"]) if not pd.isna(conf_last.get("ATR")) else None,
+                        ema_slope=float(conf_last["EMA50"]) - float(conf_last["EMA200"]),
+                        indicator_score=50.0,
+                        min_historical_samples=10,
+                    )
+                    confidence = confidence_result["confidence"]
 
                 # Debug log final confidence used for decision
                 print(f"FINAL CONFIDENCE USED: {confidence}%")
 
                 # Re-check safety rules at confirmation time - if market weakens, skip confirmation
-                should_take, skip_reason = _should_take_signal(signal_df, direction, confidence, is_next_signal)
+                # PHASE 7: Also apply confirmation re-checks with 1-minute data if available
+                should_take, skip_reason = _should_take_signal(signal_df, direction, confidence, is_next_signal, minute_df)
 
                 if should_take:
                     _, tp, sl = build_forex_targets(signal_df, direction, confidence)
@@ -1041,8 +1661,20 @@ def process_signal_list(
             ):
                 # Prefer 1-minute data for martingale checks; fallback to main df
                 mg_df = minute_df if (minute_df is not None and len(minute_df) >= 200) else df
-                if _is_strong_martingale(mg_df, direction):
-                    mg_confidence = calculate_confidence(mg_df, direction)
+                mg_valid, mg_reason = _is_strong_martingale(mg_df, direction)
+                if mg_valid:
+                    mg_last = mg_df.iloc[-1]
+                    mg_confidence_result = calculate_real_confidence(
+                        signal_time=mg_time,
+                        direction=direction,
+                        rsi=float(mg_last["RSI"]) if not pd.isna(mg_last.get("RSI")) else None,
+                        source=signal.get("source", "Martingale"),
+                        atr=float(mg_last["ATR"]) if not pd.isna(mg_last.get("ATR")) else None,
+                        ema_slope=float(mg_last["EMA50"]) - float(mg_last["EMA200"]),
+                        indicator_score=50.0,
+                        min_historical_samples=10,
+                    )
+                    mg_confidence = mg_confidence_result["confidence"]
                     signal["martingale_confidence"] = mg_confidence
                     messages.append(_build_mg_pre_message(signal, mg_confidence, mg_df))
                     print(f"FINAL CONFIDENCE USED: {mg_confidence}%")
@@ -1051,8 +1683,26 @@ def process_signal_list(
             if abs((now - mg_time).total_seconds()) <= SIGNAL_WINDOW_SECONDS:
                 # Prefer 1-minute data for martingale confirmation; fallback to main df
                 mg_df = minute_df if (minute_df is not None and len(minute_df) >= 200) else df
-                if mg_key not in processed_signals and _is_strong_martingale(mg_df, direction):
-                    mg_confidence = calculate_confidence(mg_df, direction)
+                mg_valid, mg_reason = _is_strong_martingale(mg_df, direction)
+                if mg_key not in processed_signals and mg_valid:
+                    mg_last = mg_df.iloc[-1]
+                    # PHASE 7: Apply confirmation re-checks for martingale
+                    phase7_mg_ok, phase7_mg_reason = _apply_phase7_confirmation_checks(mg_df, minute_df, direction)
+                    if not phase7_mg_ok:
+                        print(f"PHASE 7 martingale confirmation rejected: {phase7_mg_reason}")
+                        continue
+
+                    mg_confidence_result = calculate_real_confidence(
+                        signal_time=mg_time,
+                        direction=direction,
+                        rsi=float(mg_last["RSI"]) if not pd.isna(mg_last.get("RSI")) else None,
+                        source=signal.get("source", "Martingale"),
+                        atr=float(mg_last["ATR"]) if not pd.isna(mg_last.get("ATR")) else None,
+                        ema_slope=float(mg_last["EMA50"]) - float(mg_last["EMA200"]),
+                        indicator_score=50.0,
+                        min_historical_samples=10,
+                    )
+                    mg_confidence = mg_confidence_result["confidence"]
                     signal["martingale_confidence"] = mg_confidence
                     print(f"FINAL CONFIDENCE USED: {mg_confidence}%")
                     _, tp, sl = build_forex_targets(mg_df, direction, mg_confidence)
@@ -1079,6 +1729,7 @@ def process_signal_list(
                             pair=signal.get("pair", "EURUSD"),
                             confidence=mg_confidence,
                             df=mg_df,
+                            source="Martingale",  # PHASE 5: Track as Martingale
                         )
                     except Exception as e:
                         print(f"store_tracked_signal error: {e}")

@@ -1,0 +1,124 @@
+{
+  "trades": [
+    {
+      "signal_time": "2026-05-07T14:30:00",
+      "result": "WIN",
+      "confidence": 75.0,
+      "rsi": 55.0,
+      "atr": 0.001,
+      "source": "Test",
+      "pair": "EURUSD",
+      "direction": "CALL"
+    },
+    {
+      "signal_time": "2026-05-07T14:30:00",
+      "result": "WIN",
+      "confidence": 75.0,
+      "rsi": 55.0,
+      "atr": 0.001,
+      "source": "Test",
+      "pair": "EURUSD",
+      "direction": "CALL"
+    },
+    {
+      "signal_time": "2026-05-07T14:30:00",
+      "result": "WIN",
+      "confidence": 75.0,
+      "rsi": 55.0,
+      "atr": 0.001,
+      "source": "Test",
+      "pair": "EURUSD",
+      "direction": "CALL"
+    },
+    {
+      "signal_time": "2026-05-07T14:30:00",
+      "result": "WIN",
+      "confidence": 75.0,
+      "rsi": 55.0,
+      "atr": 0.001,
+      "source": "Test",
+      "pair": "EURUSD",
+      "direction": "CALL"
+    },
+    {
+      "signal_time": "2026-05-07T14:30:00",
+      "result": "WIN",
+      "confidence": 75.0,
+      "rsi": 55.0,
+      "atr": 0.001,
+      "source": "Test",
+      "pair": "EURUSD",
+      "direction": "CALL"
+    },
+    {
+      "signal_time": "2026-05-07T14:30:00",
+      "result": "WIN",
+      "confidence": 75.0,
+      "rsi": 55.0,
+      "atr": 0.001,
+      "source": "Test",
+      "pair": "EURUSD",
+      "direction": "CALL"
+    },
+    {
+      "signal_time": "2026-05-07T14:30:00",
+      "result": "WIN",
+      "confidence": 75.0,
+      "rsi": 55.0,
+      "atr": 0.001,
+      "source": "Test",
+      "pair": "EURUSD",
+      "direction": "CALL"
+    },
+    {
+      "signal_time": "2026-05-07T14:30:00",
+      "result": "WIN",
+      "confidence": 75.0,
+      "rsi": 55.0,
+      "atr": 0.001,
+      "source": "Test",
+      "pair": "EURUSD",
+      "direction": "CALL"
+    },
+    {
+      "signal_time": "2026-05-07T14:30:00",
+      "result": "WIN",
+      "confidence": 75.0,
+      "rsi": 55.0,
+      "atr": 0.001,
+      "source": "Test",
+      "pair": "EURUSD",
+      "direction": "CALL"
+    },
+    {
+      "signal_time": "2026-05-07T14:30:00",
+      "result": "WIN",
+      "confidence": 75.0,
+      "rsi": 55.0,
+      "atr": 0.001,
+      "source": "Test",
+      "pair": "EURUSD",
+      "direction": "CALL"
+    },
+    {
+      "signal_time": "2026-05-07T14:30:00",
+      "result": "WIN",
+      "confidence": 75.0,
+      "rsi": 55.0,
+      "atr": 0.001,
+      "source": "Test",
+      "pair": "EURUSD",
+      "direction": "CALL"
+    },
+    {
+      "signal_time": "2026-05-07T14:30:00",
+      "result": "WIN",
+      "confidence": 75.0,
+      "rsi": 55.0,
+      "atr": 0.001,
+      "source": "Test",
+      "pair": "EURUSD",
+      "direction": "CALL"
+    }
+  ]
+}

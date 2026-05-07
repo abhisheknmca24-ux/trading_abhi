@@ -4,6 +4,8 @@ from datetime import time as clock_time
 
 import pandas as pd
 import requests
+import market_cache
+import signal_generator
 
 # ONLY detect Railway (not BOT_TOKEN)
 if os.getenv("RAILWAY_ENVIRONMENT"):
@@ -13,7 +15,7 @@ else:
 
 from fixed_trade import get_fixed_signal
 from forex_trade import get_forex_signal
-from indicators import add_indicators, calculate_score
+from indicators import add_indicators, calculate_score, ensure_indicators
 from signal_list import (
     apply_signal_text,
     get_adaptive_trade_threshold,
@@ -21,6 +23,7 @@ from signal_list import (
     should_force_fast_mode,
     store_tracked_signal,
     update_signal_list,
+    _martingale_safety_manager,  # PHASE 5: Import safety manager
 )
 
 PAIR = "EUR/USD"
@@ -37,26 +40,9 @@ HIGH_IMPACT_NEWS_EVENTS = [
 MAX_SIGNAL_MESSAGES_PER_CYCLE = 10
 
 LAST_SIGNAL_INPUT_UPDATE_ID = None
-
-# API rate limiting
-API_CALL_TIMES = []
-API_CALLS_PER_MINUTE_LIMIT = 6
+LAST_GENERATED_CANDIDATE_REPORT_DATE = None
 
 
-def track_api_call():
-    """Track API call timestamp for rate limiting."""
-    now = time.time()
-    API_CALL_TIMES.append(now)
-    # Remove calls older than 60 seconds
-    API_CALL_TIMES[:] = [t for t in API_CALL_TIMES if now - t < 60]
-
-
-def is_api_call_allowed():
-    """Check if we can make another API call within rate limit."""
-    now = time.time()
-    # Remove calls older than 60 seconds
-    recent_calls = [t for t in API_CALL_TIMES if now - t < 60]
-    return len(recent_calls) < API_CALLS_PER_MINUTE_LIMIT
 
 
 if not TD_API_KEY:
@@ -151,16 +137,13 @@ def is_high_impact_news_window(now=None):
 # ==============================
 # TELEGRAM
 # ==============================
+import messaging
+
+
 def send_telegram(msg):
     try:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        res = requests.post(url, data={
-            "chat_id": CHAT_ID,
-            "text": msg,
-            "parse_mode": "Markdown"
-        })
-        print("Telegram:", res.text)
-
+        # route through messaging queue as DAILY_REPORT fallback
+        messaging.send("DAILY_REPORT", msg)
     except Exception as e:
         print("Telegram error:", e)
 
@@ -215,51 +198,7 @@ def fetch_signal_text_from_telegram():
 # ==============================
 # DATA FETCH
 # ==============================
-def get_data(interval):
-    if not is_api_call_allowed():
-        print(f"API rate limit reached. Skipping {interval} data fetch.")
-        return None
-
-    url = "https://api.twelvedata.com/time_series"
-
-    params = {
-        "symbol": PAIR,
-        "interval": interval,
-        "apikey": TD_API_KEY,
-        "outputsize": 200
-    }
-
-    res = requests.get(url, params=params).json()
-    track_api_call()
-
-    if "values" not in res:
-        print("API ERROR:", res)
-
-        if res.get("code") == 429:
-            send_telegram("*API Rate Limit Hit*\n\nWaiting 60 seconds before retry.")
-            time.sleep(65)
-            return None
-
-        send_telegram(f"*API Error*\n\n{res}")
-        return None
-
-    df = pd.DataFrame(res["values"])
-
-    if "datetime" in df.columns:
-        df["CandleTime"] = pd.to_datetime(df["datetime"])
-
-    price_columns = ["open", "high", "low", "close"]
-    df[price_columns] = df[price_columns].astype(float)
-    df = df.iloc[::-1]
-
-    df.rename(columns={
-        "open": "Open",
-        "high": "High",
-        "low": "Low",
-        "close": "Close"
-    }, inplace=True)
-
-    return df
+# Data fetches are centralized in market_cache.py
 
 
 def run_external_signal_engine(df, cached_minute_df=None):
@@ -271,9 +210,9 @@ def run_external_signal_engine(df, cached_minute_df=None):
         fallback_df = None
         if cached_minute_df is not None and len(cached_minute_df) >= 200:
             fallback_df = cached_minute_df
-        elif is_api_call_allowed():
+        else:
             try:
-                fallback_df = get_data("5min")
+                fallback_df = market_cache.get_5m_df(PAIR)
             except Exception:
                 fallback_df = None
 
@@ -283,11 +222,47 @@ def run_external_signal_engine(df, cached_minute_df=None):
     if cached_minute_df is not None:
         minute_data_fetcher = lambda: cached_minute_df
     else:
-        minute_data_fetcher = lambda: get_data("1min") if is_api_call_allowed() else None
+        minute_data_fetcher = lambda: market_cache.get_1m_df(PAIR)
 
     signal_messages = process_signal_list(df, minute_data_fetcher=minute_data_fetcher)
-    for signal_message in signal_messages[:MAX_SIGNAL_MESSAGES_PER_CYCLE]:
-        send_telegram(signal_message)
+    # signal_messages are tuples (type, text)
+    sent = 0
+    for item in signal_messages:
+        if sent >= MAX_SIGNAL_MESSAGES_PER_CYCLE:
+            break
+        if isinstance(item, tuple) and len(item) == 2:
+            typ, text = item
+            try:
+                messaging.send(typ, text)
+                sent += 1
+            except Exception as e:
+                print(f"messaging error: {e}")
+        elif isinstance(item, str):
+            # legacy: send as DAILY_REPORT
+            try:
+                messaging.send("DAILY_REPORT", item)
+                sent += 1
+            except Exception as e:
+                print(f"messaging error: {e}")
+
+
+def maybe_publish_generated_candidates(df, cached_minute_df=None):
+    """Publish generated signals as candidate-only daily reports."""
+    global LAST_GENERATED_CANDIDATE_REPORT_DATE
+
+    now = pd.Timestamp.now(tz="Asia/Kolkata")
+    today = now.floor("D")
+    if LAST_GENERATED_CANDIDATE_REPORT_DATE == today:
+        return
+
+    live_df = cached_minute_df if cached_minute_df is not None and len(cached_minute_df) >= 200 else df
+    candidates = signal_generator.generate_if_needed(now=now, live_df=live_df)
+    if not candidates:
+        return
+
+    report = signal_generator.format_candidate_report(candidates)
+    messaging.send("DAILY_REPORT", report)
+    LAST_GENERATED_CANDIDATE_REPORT_DATE = today
 
 
 # ==============================
@@ -295,10 +270,29 @@ def run_external_signal_engine(df, cached_minute_df=None):
 # ==============================
 def run():
     print("BOT RUNNING")
-    send_telegram("*Bot Started*\n\nSmart Mode Active.")
+    # Startup health message
+    try:
+        from learning_engine import learning_summary
+        import signal_generator
+        import market_cache as _mc
+
+        cache_status = "OK" if getattr(_mc, "last_successful_5m", None) is not None else "No cached 5m"
+        learning = learning_summary()
+        ls = learning.get("total_trades") if isinstance(learning, dict) else None
+        health_msg = (
+            "*Bot Online*\n\n"
+            f"Cache: {cache_status}\n"
+            "Signal engine: active\n"
+            "Learning engine: active\n"
+            f"Learning trades: {ls}\n"
+        )
+        messaging.send("DAILY_REPORT", health_msg)
+    except Exception:
+        messaging.send("DAILY_REPORT", "*Bot Started* - health check unavailable")
 
     last_signal_time = None
     last_trade_time = None
+    last_safety_report_time = None  # PHASE 5: Track martingale status reporting
     cached_interval = None
     cached_candle_key = None
     cached_df = None
@@ -344,7 +338,10 @@ def run():
                 df = cached_df.copy()
                 print(f"Using cached {interval} data")
             else:
-                df = get_data(interval)
+                if interval == "5min":
+                    df = market_cache.get_5m_df(PAIR)
+                else:
+                    df = market_cache.get_1m_df(PAIR)
 
                 if df is not None:
                     cached_interval = interval
@@ -361,16 +358,17 @@ def run():
             now_minute_key = now_timestamp.floor("min")
             
             if cached_minute_df is None or cached_minute_time != now_minute_key:
-                if is_api_call_allowed():
-                    cached_minute_df = get_data("1min")
+                cm = market_cache.get_1m_df(PAIR)
+                if cm is not None:
+                    cached_minute_df = cm
                     cached_minute_time = now_minute_key
-                else:
-                    cached_minute_df = None
 
             # 4) Run auto bot logic.
-            df = add_indicators(df)
+            df = ensure_indicators(df)
+            maybe_publish_generated_candidates(df, cached_minute_df)
             confidence, grade = calculate_score(df)
-            trade_threshold = get_adaptive_trade_threshold(75)
+            # Use adaptive trade threshold with base 68 per updated settings
+            trade_threshold = get_adaptive_trade_threshold(68)
 
             # Debug: print final confidence used by bot decision path
             print(f"FINAL CONFIDENCE USED: {confidence}%")
@@ -477,6 +475,7 @@ Auto Close: {forex['auto_close']}
                         pair="EURUSD",
                         confidence=confidence,
                         df=df,
+                        source="Regular",  # PHASE 5: Mark as regular auto trade
                     )
                 except Exception as e:
                     print("Tracking error:", e)
@@ -487,12 +486,28 @@ Auto Close: {forex['auto_close']}
             else:
                 print("No signal")
 
+            # PHASE 5: Periodic martingale safety status report (every 30 minutes)
+            now = pd.Timestamp.now(tz="Asia/Kolkata")
+            if last_safety_report_time is None or (now - last_safety_report_time).total_seconds() > 1800:
+                try:
+                    safety_status = _martingale_safety_manager.get_status_report()
+                    send_telegram(safety_status)
+                    last_safety_report_time = now
+                    print("Martingale safety status sent")
+                except Exception as e:
+                    print(f"Error sending safety status: {e}")
+
             # 5) Process external signal list with the same df.
             run_external_signal_engine(df, cached_minute_df)
             time.sleep(sleep_time)
 
         except Exception as e:
-            print("Error:", e)
+            print(f"Error in main loop: {e}")
+            # Fail-safe: provide status and recover gracefully
+            try:
+                messaging.send("DAILY_REPORT", f"⚠️ *Bot Error*\n\nBot recovered from error: {str(e)[:50]}\n\nRestarting...")
+            except Exception:
+                pass
             time.sleep(60)
 
 

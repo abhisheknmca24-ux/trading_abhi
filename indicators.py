@@ -13,6 +13,21 @@ def add_indicators(df):
     return df
 
 
+def ensure_indicators(df):
+    """Ensure indicator columns exist on `df`. Compute only missing indicators."""
+    # If df is None or too small, just return as-is
+    if df is None:
+        return df
+
+    required_cols = ["EMA50", "EMA200", "RSI", "ATR", "TrendStrength"]
+    missing = [c for c in required_cols if c not in df.columns]
+    if not missing:
+        return df
+
+    # compute all indicators in one pass
+    return add_indicators(df)
+
+
 def calculate_score(df):
     last = df.iloc[-1]
     prev = df.iloc[-2]

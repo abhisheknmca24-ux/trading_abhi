@@ -34,13 +34,13 @@ def get_fixed_signal(df):
     if atr <= atr_mean:
         return None
 
-    if candle_size <= avg_candle:
+    if candle_size <= avg_candle * 0.8:
         return None
 
     if distance > ema_distance_threshold:
         return None
 
-    if trend_strength <= trend_threshold:
+    if trend_strength <= trend_threshold * 0.8:
         return None
 
     if (
