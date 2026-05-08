@@ -144,6 +144,12 @@ def _build_signal_state(entries: List[SignalEntry], source: str = "telegram") ->
             "martingale_prealert_sent": False,
             "martingale_confirmed_sent": False,
             "martingale_confidence": 0,
+            "raw_line": entry.raw_line,
+            # Forced-signal extras (default to None/False for non-forced signals)
+            "is_forced": False,
+            "forced_type": None,
+            "low_confidence": False,
+            "stored_confidence": 0,
         }
         for entry in entries
     ]
@@ -281,75 +287,6 @@ def _merge_generated_into_manager() -> None:
         manager.active_signals.extend(_build_signal_state(new_entries, source="generated"))
 
 
-def load_generated_signals(current_day: Optional[date] = None) -> List[dict]:
-    """Load signals from generated_signals.json and convert to signal states."""
-    if current_day is None:
-        current_day = _now().date()
-
-    file_path = "generated_signals.json"
-    if not os.path.exists(file_path):
-        return []
-
-    try:
-        with open(file_path, "r") as f:
-            generated = json.load(f)
-
-        states = []
-        tz = _get_timezone()
-
-        for item in generated:
-            try:
-                t_str = item.get("time", "")
-                if ":" not in t_str:
-                    continue
-
-                hour, minute = map(int, t_str.split(":"))
-                signal_time = datetime.combine(current_day, time(hour, minute))
-
-                if tz is not None:
-                    signal_time = signal_time.replace(tzinfo=tz)
-
-                is_forced = item.get("source") == "forced"
-                sig_type = item.get("signal_type", "direct")
-                low_conf = item.get("low_confidence", False)
-
-                entry = SignalEntry(
-                    signal_time=signal_time,
-                    pair=item.get("pair", "EURUSD"),
-                    direction=item.get("direction", "CALL").upper(),
-                    raw_line=(
-                        f"{t_str} {item.get('pair')} {item.get('direction')} "
-                        f"({'FORCED' if is_forced else 'GENERATED'})"
-                    )
-                )
-                # Build base state and enrich with forced-signal metadata
-                state = {
-                    "time": entry.signal_time,
-                    "pair": entry.pair,
-                    "direction": entry.direction,
-                    "source": item.get("source", "generated"),
-                    "pre_sent": False,
-                    "confirmed_sent": False,
-                    "martingale_time": entry.signal_time + MARTINGALE_ENTRY_DELAY,
-                    "martingale_prealert_sent": False,
-                    "martingale_confirmed_sent": False,
-                    "martingale_confidence": 0,
-                    "raw_line": entry.raw_line,
-                    # Forced-signal extras
-                    "is_forced": is_forced,
-                    "forced_type": sig_type if is_forced else None,
-                    "low_confidence": low_conf,
-                    "stored_confidence": item.get("confidence", 0),
-                }
-                states.append(state)
-            except Exception as e:
-                logger.error(f"Error parsing generated signal item: {e}")
-                continue
-
-        return states
-    except Exception as e:
-        logger.error(f"Error loading generated signals: {e}")
-        return []
 
 
 def _merge_states(primary: List[dict], secondary: List[dict]) -> List[dict]:
