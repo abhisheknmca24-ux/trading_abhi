@@ -256,16 +256,14 @@ def load_generated_signals() -> List[SignalEntry]:
     return entries
 
 
-def _merge_generated_into_signal_list() -> None:
-    """Merge generated signal entries into signal_list, avoiding duplicates."""
-    global signal_list
-
+def _merge_generated_into_manager() -> None:
+    """Merge generated signal entries into manager.active_signals, avoiding duplicates."""
     generated_entries = load_generated_signals()
     if not generated_entries:
         return
 
     existing_keys = set()
-    for sig in signal_list:
+    for sig in manager.active_signals:
         try:
             key = _signal_key(sig["time"], sig["direction"])
             existing_keys.add(key)
@@ -280,7 +278,7 @@ def _merge_generated_into_signal_list() -> None:
             new_entries.append(entry)
 
     if new_entries:
-        signal_list.extend(_build_signal_state(new_entries))
+        manager.active_signals.extend(_build_signal_state(new_entries, source="generated"))
 
 
 def load_generated_signals(current_day: Optional[date] = None) -> List[dict]:
@@ -391,8 +389,9 @@ def update_signal_list(signal_lines: Optional[List[str]] = None, now: Optional[d
         manager.confirmed_signal_count = 0
 
     if signal_lines is None:
-        last_signal_update_time = now
-        return signal_list
+        manager.last_signal_update_time = now
+        _merge_generated_into_manager()
+        return manager.active_signals
 
     if isinstance(signal_lines, str):
         signal_lines = signal_lines.splitlines()
@@ -401,27 +400,29 @@ def update_signal_list(signal_lines: Optional[List[str]] = None, now: Optional[d
         signal_lines = []
 
     if not signal_lines:
-        signal_list = []
-        processed_signals = set()
-        last_update_id = None
-        evaluated_signal_count = 0
-        confirmed_signal_count = 0
-        last_signal_update_time = now
-        return signal_list
+        manager.active_signals = []
+        manager.processed_signals = set()
+        manager.last_update_id = None
+        manager.evaluated_signal_count = 0
+        manager.confirmed_signal_count = 0
+        manager.last_signal_update_time = now
+        _merge_generated_into_manager()
+        return manager.active_signals
 
     update_id = f"mem-{current_day.isoformat()}-{len(signal_lines)}-{'|'.join(signal_lines)}"
 
-    if update_id != last_update_id:
+    if update_id != manager.last_update_id:
         entries = load_signal_entries(signal_lines, current_day)
-        signal_list = _build_signal_state(entries)
-        processed_signals = set()
-        evaluated_signal_count = 0
-        confirmed_signal_count = 0
-        last_update_id = update_id
+        manager.active_signals = _build_signal_state(entries)
+        manager.processed_signals = set()
+        manager.evaluated_signal_count = 0
+        manager.confirmed_signal_count = 0
+        manager.last_update_id = update_id
         print("Signal list updated")
 
-    last_signal_update_time = now
-    return signal_list
+    _merge_generated_into_manager()
+    manager.last_signal_update_time = now
+    return manager.active_signals
 
 
 def apply_signal_text(signal_text: str, now: Optional[datetime] = None) -> List[dict]:

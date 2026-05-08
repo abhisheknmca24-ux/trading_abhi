@@ -1,5 +1,5 @@
 from datetime import datetime
-from signal_list import update_signal_list, signal_list
+from signal_list import update_signal_list
 
 # Mock some telegram lines
 telegram_lines = ["15:30 EURUSD CALL"]
