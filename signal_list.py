@@ -9,8 +9,6 @@ from typing import Callable, List, Optional
 
 import pandas as pd
 
-from indicators import add_indicators
-
 try:
     from zoneinfo import ZoneInfo
 except ImportError:  # pragma: no cover
@@ -231,7 +229,6 @@ def validate_sniper_signal(df: pd.DataFrame, direction: str) -> bool:
     if df is None or len(df) < 200:
         return False
 
-    df = add_indicators(df)
     last = df.iloc[-1]
     prev = df.iloc[-2]
 
@@ -282,7 +279,6 @@ def validate_martingale_signal(df: pd.DataFrame, direction: str) -> bool:
     if not validate_sniper_signal(df, direction):
         return False
 
-    df = add_indicators(df)
     last = df.iloc[-1]
     prev = df.iloc[-2]
 
@@ -305,7 +301,6 @@ def validate_martingale_signal(df: pd.DataFrame, direction: str) -> bool:
 
 
 def calculate_confidence(df: pd.DataFrame, direction: str) -> int:
-    df = add_indicators(df)
     last = df.iloc[-1]
     prev = df.iloc[-2]
     atr = float(last["ATR"]) if not pd.isna(last.get("ATR")) else 0.0
@@ -353,7 +348,6 @@ def calculate_confidence(df: pd.DataFrame, direction: str) -> int:
 
 
 def build_forex_targets(df: pd.DataFrame, direction: str, confidence: int) -> tuple[float, float, float]:
-    df = add_indicators(df)
     last = df.iloc[-1]
     atr = float(last["ATR"])
     entry = float(last["Close"])
@@ -506,7 +500,6 @@ def _check_safety_rules(df: pd.DataFrame, direction: str, confidence: int) -> tu
     if df is None or len(df) < 200:
         return False, "insufficient data"
 
-    df = add_indicators(df)
     last = df.iloc[-1]
     prev = df.iloc[-2]
 
@@ -893,8 +886,6 @@ def process_signal_list(
     if minute_data_fetcher is not None:
         try:
             minute_df = minute_data_fetcher()
-            if minute_df is not None and len(minute_df) >= 200:
-                minute_df = add_indicators(minute_df)
         except Exception:
             minute_df = None
 

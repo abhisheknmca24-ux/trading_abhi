@@ -274,6 +274,8 @@ def run_external_signal_engine(df, cached_minute_df=None):
         elif is_api_call_allowed():
             try:
                 fallback_df = get_data("5min")
+                if fallback_df is not None and len(fallback_df) >= 200:
+                    fallback_df = add_indicators(fallback_df)
             except Exception:
                 fallback_df = None
 
@@ -283,7 +285,13 @@ def run_external_signal_engine(df, cached_minute_df=None):
     if cached_minute_df is not None:
         minute_data_fetcher = lambda: cached_minute_df
     else:
-        minute_data_fetcher = lambda: get_data("1min") if is_api_call_allowed() else None
+        def minute_data_fetcher():
+            if not is_api_call_allowed():
+                return None
+            minute_df = get_data("1min")
+            if minute_df is None or len(minute_df) < 200:
+                return minute_df
+            return add_indicators(minute_df)
 
     signal_messages = process_signal_list(df, minute_data_fetcher=minute_data_fetcher)
     for signal_message in signal_messages[:MAX_SIGNAL_MESSAGES_PER_CYCLE]:
@@ -347,6 +355,7 @@ def run():
                 df = get_data(interval)
 
                 if df is not None:
+                    df = add_indicators(df)
                     cached_interval = interval
                     cached_candle_key = current_candle_key
                     cached_df = df.copy()
@@ -363,12 +372,13 @@ def run():
             if cached_minute_df is None or cached_minute_time != now_minute_key:
                 if is_api_call_allowed():
                     cached_minute_df = get_data("1min")
+                    if cached_minute_df is not None and len(cached_minute_df) >= 200:
+                        cached_minute_df = add_indicators(cached_minute_df)
                     cached_minute_time = now_minute_key
                 else:
                     cached_minute_df = None
 
             # 4) Run auto bot logic.
-            df = add_indicators(df)
             confidence, grade = calculate_score(df)
             trade_threshold = get_adaptive_trade_threshold(75)
 
