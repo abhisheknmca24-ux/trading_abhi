@@ -1,3 +1,4 @@
+from logger import logger
 import os
 import time
 from datetime import time as clock_time
@@ -22,12 +23,14 @@ from signal_list import (
     store_tracked_signal,
     update_signal_list,
 )
+from market_safety import run_market_safety
+from cache_manager import cache
 
 PAIR = "EUR/USD"
 SLEEP_TIME = 120   # 2 minutes
 IDLE_SLEEP_TIME = 900   # 15 minutes during weekends/off-market hours
-MARKET_OPEN_TIME = clock_time(13, 30)
-MARKET_CLOSE_TIME = clock_time(21, 30)
+MARKET_OPEN_TIME = clock_time(13, 0)
+MARKET_CLOSE_TIME = clock_time(22, 0)  # London/NY Prime ONLY (Aligned with generator)
 NEWS_BLOCK_MINUTES = 15
 TRADE_COOLDOWN_MINUTES = 20
 HIGH_IMPACT_NEWS_EVENTS = [
@@ -40,7 +43,8 @@ LAST_SIGNAL_INPUT_UPDATE_ID = None
 
 # API rate limiting
 API_CALL_TIMES = []
-API_CALLS_PER_MINUTE_LIMIT = 6
+API_CALLS_PER_MINUTE_LIMIT = 5
+_rate_limit_pause_until = 0.0  # epoch seconds; set on 429 for 90-second cooldown
 
 
 def track_api_call():
@@ -54,6 +58,10 @@ def track_api_call():
 def is_api_call_allowed():
     """Check if we can make another API call within rate limit."""
     now = time.time()
+    if now < _rate_limit_pause_until:
+        remaining = int(_rate_limit_pause_until - now)
+        logger.info(f"Emergency cooldown active — skipping API call ({remaining}s remaining)")
+        return False
     # Remove calls older than 60 seconds
     recent_calls = [t for t in API_CALL_TIMES if now - t < 60]
     return len(recent_calls) < API_CALLS_PER_MINUTE_LIMIT
@@ -116,16 +124,7 @@ def is_near_candle_close():
     return now.second >= 45
 
 
-def get_current_candle_key(interval):
-    now = pd.Timestamp.now(tz="Asia/Kolkata")
-
-    if interval == "1min":
-        return now.floor("min")
-
-    if interval == "5min":
-        return now.floor("5min")
-
-    return now.floor("min")
+# get_current_candle_key moved to cache_manager.py
 
 
 def is_high_impact_news_window(now=None):
@@ -159,10 +158,10 @@ def send_telegram(msg):
             "text": msg,
             "parse_mode": "Markdown"
         })
-        print("Telegram:", res.text)
+        logger.info(f"Telegram: {res.text}")
 
     except Exception as e:
-        print("Telegram error:", e)
+        logger.error(f"Telegram error: {e}")
 
 
 def fetch_signal_text_from_telegram():
@@ -208,7 +207,7 @@ def fetch_signal_text_from_telegram():
         return latest_text
 
     except Exception as e:
-        print("Telegram input error:", e)
+        logger.error(f"Telegram input error: {e}")
         return None
 
 
@@ -217,7 +216,7 @@ def fetch_signal_text_from_telegram():
 # ==============================
 def get_data(interval):
     if not is_api_call_allowed():
-        print(f"API rate limit reached. Skipping {interval} data fetch.")
+        logger.info(f"API rate limit reached. Skipping {interval} data fetch.")
         return None
 
     url = "https://api.twelvedata.com/time_series"
@@ -233,14 +232,15 @@ def get_data(interval):
     track_api_call()
 
     if "values" not in res:
-        print("API ERROR:", res)
+        logger.error(f"API ERROR: {res}")
 
         if res.get("code") == 429:
-            send_telegram("*API Rate Limit Hit*\n\nWaiting 60 seconds before retry.")
-            time.sleep(65)
+            global _rate_limit_pause_until
+            _rate_limit_pause_until = time.time() + 90
+            logger.warning("429 received — emergency cooldown: all fetches paused for 90 seconds.")
             return None
 
-        send_telegram(f"*API Error*\n\n{res}")
+        logger.error(f"*API Error* {res}")
         return None
 
     df = pd.DataFrame(res["values"])
@@ -294,16 +294,10 @@ def run_external_signal_engine(df, cached_minute_df=None):
 # MAIN LOOP
 # ==============================
 def run():
-    print("BOT RUNNING")
-    send_telegram("*Bot Started*\n\nSmart Mode Active.")
+    logger.info("BOT RUNNING")
 
     last_signal_time = None
     last_trade_time = None
-    cached_interval = None
-    cached_candle_key = None
-    cached_df = None
-    cached_minute_df = None
-    cached_minute_time = None
 
     while True:
         try:
@@ -318,12 +312,12 @@ def run():
             market_open, _ = get_market_status()
 
             if not market_open:
-                print("Market closed — idle mode")
-                print(f"Next market open: {get_next_market_open():%Y-%m-%d %H:%M %Z}")
+                logger.info("Market closed — idle mode")
+                logger.info(f"Next market open: {get_next_market_open():%Y-%m-%d %H:%M %Z}")
                 time.sleep(get_idle_sleep_seconds())
                 continue
 
-            print("Market Open — Running")
+            logger.info("Market Open — Running")
 
             force_fast_mode = should_force_fast_mode()
 
@@ -334,57 +328,46 @@ def run():
                 interval = "5min"
                 sleep_time = SLEEP_TIME
 
-            current_candle_key = get_current_candle_key(interval)
-
-            if (
-                cached_df is not None
-                and cached_interval == interval
-                and cached_candle_key == current_candle_key
-            ):
-                df = cached_df.copy()
-                print(f"Using cached {interval} data")
-            else:
-                df = get_data(interval)
-
-                if df is not None:
-                    cached_interval = interval
-                    cached_candle_key = current_candle_key
-                    cached_df = df.copy()
+            df = cache.get_processed_dataframe(interval, get_data, add_indicators)
 
             # 3) Fetch df is complete above.
             if df is None:
                 time.sleep(sleep_time)
                 continue
 
-            # Cache 1-minute data once per minute for all signal processing
-            now_timestamp = pd.Timestamp.now(tz="Asia/Kolkata")
-            now_minute_key = now_timestamp.floor("min")
-            
-            if cached_minute_df is None or cached_minute_time != now_minute_key:
-                if is_api_call_allowed():
-                    cached_minute_df = get_data("1min")
-                    cached_minute_time = now_minute_key
-                else:
-                    cached_minute_df = None
+            # Fetch 1-minute data using cache manager
+            cached_minute_df = cache.get_dataframe("1min", get_data)
 
             # 4) Run auto bot logic.
-            df = add_indicators(df)
+            # df is already processed with indicators
             confidence, grade = calculate_score(df)
             trade_threshold = get_adaptive_trade_threshold(75)
 
             # Debug: print final confidence used by bot decision path
-            print(f"FINAL CONFIDENCE USED: {confidence}%")
+            logger.debug(f"FINAL CONFIDENCE USED: {confidence}%")
 
             if confidence < trade_threshold:
-                print(f"Signal rejected - confidence too low: {confidence}% (threshold {trade_threshold}%)")
+                logger.info(f"Signal rejected - confidence too low: {confidence}% (threshold {trade_threshold}%)")
                 # 5) Run external signal processing after auto bot.
                 run_external_signal_engine(df, cached_minute_df)
                 time.sleep(sleep_time)
                 continue
 
             fixed = get_fixed_signal(df)
-
+            
             if fixed:
+                # NEW: Market Safety Check for Auto-Bot
+                safety_ok, safety_msg, penalty = run_market_safety(df, fixed['signal'])
+                
+                # Apply penalty to confidence
+                confidence -= penalty
+                
+                if not safety_ok or confidence < trade_threshold:
+                    reason = safety_msg if not safety_ok else f"Confidence dropped below threshold after safety penalty ({confidence}% < {trade_threshold}%)"
+                    logger.info(f"Auto-trade rejected: {reason}")
+                    run_external_signal_engine(df, cached_minute_df)
+                    time.sleep(sleep_time)
+                    continue
                 now = pd.Timestamp.now(tz="Asia/Kolkata")
 
                 if last_trade_time is not None:
@@ -392,7 +375,7 @@ def run():
 
                     if cooldown_minutes < TRADE_COOLDOWN_MINUTES:
                         remaining = TRADE_COOLDOWN_MINUTES - cooldown_minutes
-                        print(f"Trade cooldown active - {remaining:.1f} min remaining")
+                        logger.info(f"Trade cooldown active - {remaining:.1f} min remaining")
                         run_external_signal_engine(df, cached_minute_df)
                         time.sleep(sleep_time)
                         continue
@@ -400,7 +383,7 @@ def run():
                 news_blocked, news_time = is_high_impact_news_window()
 
                 if news_blocked:
-                    print(f"Trade blocked due to high-impact news at {news_time:%H:%M}")
+                    logger.info(f"Trade blocked due to high-impact news at {news_time:%H:%M}")
                     run_external_signal_engine(df, cached_minute_df)
                     time.sleep(sleep_time)
                     continue
@@ -408,12 +391,12 @@ def run():
                 current_candle_time = df.iloc[-1].get("CandleTime", df.index[-1])
 
                 if current_candle_time == last_signal_time:
-                    print("Duplicate signal skipped")
+                    logger.debug("Duplicate signal skipped")
                     run_external_signal_engine(df, cached_minute_df)
                     time.sleep(sleep_time)
                     continue
 
-                print("Score:", confidence, grade)
+                logger.info(f"Score: {confidence} {grade}")
 
                 send_telegram(f"""
 *PRE-SIGNAL*
@@ -462,7 +445,7 @@ Multiplier: {forex['multiplier']}
 Auto Close: {forex['auto_close']}
 """
 
-                print(msg)
+                logger.info(msg)
                 send_telegram(msg)
                 try:
                     entry_price = float(df.iloc[-1]["Close"])
@@ -477,22 +460,27 @@ Auto Close: {forex['auto_close']}
                         pair="EURUSD",
                         confidence=confidence,
                         df=df,
+                        source="auto",
                     )
                 except Exception as e:
-                    print("Tracking error:", e)
+                    logger.error(f"Tracking error: {e}")
 
-                last_signal_time = current_candle_time
                 last_trade_time = pd.Timestamp.now(tz="Asia/Kolkata")
 
             else:
-                print("No signal")
+                logger.debug(f"Candle {current_candle_time}: No automated signal found.")
 
             # 5) Process external signal list with the same df.
             run_external_signal_engine(df, cached_minute_df)
+
+            # 6) Final update of last_signal_time to prevent re-processing same candle
+            last_signal_time = current_candle_time
+            logger.debug(f"Candle {current_candle_time} processing completed.")
+            
             time.sleep(sleep_time)
 
         except Exception as e:
-            print("Error:", e)
+            logger.error(f"Error: {e}")
             time.sleep(60)
 
 
