@@ -168,10 +168,10 @@ def send_telegram(msg):
             "text": msg,
             "parse_mode": "Markdown"
         })
-        logger.info("Telegram:", res.text)
+        logger.info("Telegram: %s", res.text)
 
     except Exception as e:
-        logger.warning("Telegram error:", e)
+        logger.warning("Telegram error: %s", e)
 
 
 def fetch_signal_text_from_telegram():
@@ -217,7 +217,7 @@ def fetch_signal_text_from_telegram():
         return latest_text
 
     except Exception as e:
-        logger.warning("Telegram input error:", e)
+        logger.warning("Telegram input error: %s", e)
         return None
 
 
@@ -226,7 +226,7 @@ def fetch_signal_text_from_telegram():
 # ==============================
 def get_data(interval):
     if not is_api_call_allowed():
-        logger.info(f"API rate limit reached. Skipping {interval} data fetch.")
+        logger.info("API rate limit reached. Skipping %s data fetch.", interval)
         return None
 
     url = "https://api.twelvedata.com/time_series"
@@ -242,7 +242,7 @@ def get_data(interval):
     track_api_call()
 
     if "values" not in res:
-        logger.warning("API ERROR:", res)
+        logger.warning("API ERROR: %s", res)
 
         if res.get("code") == 429:
             send_telegram("*API Rate Limit Hit*\n\nWaiting 60 seconds before retry.")
@@ -328,7 +328,7 @@ def run():
 
             if not market_open:
                 logger.info("Market closed — idle mode")
-                logger.info(f"Next market open: {get_next_market_open():%Y-%m-%d %H:%M %Z}")
+                logger.info("Next market open: %s", get_next_market_open().strftime("%Y-%m-%d %H:%M %Z"))
                 time.sleep(get_idle_sleep_seconds())
                 continue
 
@@ -351,7 +351,7 @@ def run():
                 and cached_candle_key == current_candle_key
             ):
                 df = cached_df.copy()
-                logger.debug(f"Using cached {interval} data")
+                logger.debug("Using cached %s data", interval)
             else:
                 df = get_data(interval)
 
@@ -382,10 +382,10 @@ def run():
             trade_threshold = get_adaptive_trade_threshold(75)
 
             # Debug: print final confidence used by bot decision path
-            logger.debug(f"FINAL CONFIDENCE USED: {confidence}%")
+            logger.debug("FINAL CONFIDENCE USED: %d%%", confidence)
 
             if confidence < trade_threshold:
-                logger.info(f"Signal rejected - confidence too low: {confidence}% (threshold {trade_threshold}%)")
+                logger.info("Signal rejected - confidence too low: %d%% (threshold %d%%)", confidence, trade_threshold)
                 # 5) Run external signal processing after auto bot.
                 run_external_signal_engine(df, cached_minute_df)
                 time.sleep(sleep_time)
@@ -401,7 +401,7 @@ def run():
 
                     if cooldown_minutes < TRADE_COOLDOWN_MINUTES:
                         remaining = TRADE_COOLDOWN_MINUTES - cooldown_minutes
-                        logger.info(f"Trade cooldown active - {remaining:.1f} min remaining")
+                        logger.info("Trade cooldown active - %.1f min remaining", remaining)
                         run_external_signal_engine(df, cached_minute_df)
                         time.sleep(sleep_time)
                         continue
@@ -409,7 +409,7 @@ def run():
                 news_blocked, news_time = is_high_impact_news_window()
 
                 if news_blocked:
-                    logger.info(f"Trade blocked due to high-impact news at {news_time:%H:%M}")
+                    logger.info("Trade blocked due to high-impact news at %s", news_time.strftime("%H:%M"))
                     run_external_signal_engine(df, cached_minute_df)
                     time.sleep(sleep_time)
                     continue
