@@ -19,8 +19,37 @@ from signal_list import (
     get_adaptive_trade_threshold,
     process_signal_list,
     should_force_fast_mode,
-    store_tracked_signal,
     update_signal_list,
+)
+from market_cache import (
+    get_5m_data, 
+    get_1m_data, 
+    get_data, 
+    set_processed_df, 
+    get_processed_df,
+    update_processed_df,
+    get_cache_stats,
+)
+from risk_management import get_risk_manager, TradingMode
+from market_safety import (
+    check_market_safety,
+    is_optimal_session,
+    get_current_session,
+)
+from day_reset import check_and_perform_reset, should_reset_day
+from smart_signal_manager import (
+    get_signal_manager,
+    create_signal,
+    process_signals,
+    get_signal_stats,
+    SignalStatus,
+)
+from telegram_queue import (
+    get_telegram_queue,
+    send_telegram_queued,
+    send_telegram_immediate,
+    TelegramFormatter,
+    MessageType,
 )
 
 PAIR = "EUR/USD"
@@ -37,26 +66,6 @@ HIGH_IMPACT_NEWS_EVENTS = [
 MAX_SIGNAL_MESSAGES_PER_CYCLE = 10
 
 LAST_SIGNAL_INPUT_UPDATE_ID = None
-
-# API rate limiting
-API_CALL_TIMES = []
-API_CALLS_PER_MINUTE_LIMIT = 6
-
-
-def track_api_call():
-    """Track API call timestamp for rate limiting."""
-    now = time.time()
-    API_CALL_TIMES.append(now)
-    # Remove calls older than 60 seconds
-    API_CALL_TIMES[:] = [t for t in API_CALL_TIMES if now - t < 60]
-
-
-def is_api_call_allowed():
-    """Check if we can make another API call within rate limit."""
-    now = time.time()
-    # Remove calls older than 60 seconds
-    recent_calls = [t for t in API_CALL_TIMES if now - t < 60]
-    return len(recent_calls) < API_CALLS_PER_MINUTE_LIMIT
 
 
 if not TD_API_KEY:
@@ -212,54 +221,6 @@ def fetch_signal_text_from_telegram():
         return None
 
 
-# ==============================
-# DATA FETCH
-# ==============================
-def get_data(interval):
-    if not is_api_call_allowed():
-        print(f"API rate limit reached. Skipping {interval} data fetch.")
-        return None
-
-    url = "https://api.twelvedata.com/time_series"
-
-    params = {
-        "symbol": PAIR,
-        "interval": interval,
-        "apikey": TD_API_KEY,
-        "outputsize": 200
-    }
-
-    res = requests.get(url, params=params).json()
-    track_api_call()
-
-    if "values" not in res:
-        print("API ERROR:", res)
-
-        if res.get("code") == 429:
-            send_telegram("*API Rate Limit Hit*\n\nWaiting 60 seconds before retry.")
-            time.sleep(65)
-            return None
-
-        send_telegram(f"*API Error*\n\n{res}")
-        return None
-
-    df = pd.DataFrame(res["values"])
-
-    if "datetime" in df.columns:
-        df["CandleTime"] = pd.to_datetime(df["datetime"])
-
-    price_columns = ["open", "high", "low", "close"]
-    df[price_columns] = df[price_columns].astype(float)
-    df = df.iloc[::-1]
-
-    df.rename(columns={
-        "open": "Open",
-        "high": "High",
-        "low": "Low",
-        "close": "Close"
-    }, inplace=True)
-
-    return df
 
 
 def run_external_signal_engine(df, cached_minute_df=None):
@@ -271,7 +232,7 @@ def run_external_signal_engine(df, cached_minute_df=None):
         fallback_df = None
         if cached_minute_df is not None and len(cached_minute_df) >= 200:
             fallback_df = cached_minute_df
-        elif is_api_call_allowed():
+        else:
             try:
                 fallback_df = get_data("5min")
             except Exception:
@@ -283,7 +244,7 @@ def run_external_signal_engine(df, cached_minute_df=None):
     if cached_minute_df is not None:
         minute_data_fetcher = lambda: cached_minute_df
     else:
-        minute_data_fetcher = lambda: get_data("1min") if is_api_call_allowed() else None
+        minute_data_fetcher = lambda: get_data("1min")
 
     signal_messages = process_signal_list(df, minute_data_fetcher=minute_data_fetcher)
     for signal_message in signal_messages[:MAX_SIGNAL_MESSAGES_PER_CYCLE]:
@@ -295,7 +256,7 @@ def run_external_signal_engine(df, cached_minute_df=None):
 # ==============================
 def run():
     print("BOT RUNNING")
-    send_telegram("*Bot Started*\n\nSmart Mode Active.")
+    send_telegram("*Bot Started*\n\nSmart Mode Active with Risk Management.")
 
     last_signal_time = None
     last_trade_time = None
@@ -304,9 +265,30 @@ def run():
     cached_df = None
     cached_minute_df = None
     cached_minute_time = None
+    
+    last_daily_signal_generation = None
+    from signal_generator import generate_daily_signals
+    
+    # Initialize Risk Manager
+    risk_manager = get_risk_manager()
+
+    # Send startup diagnostics
+    startup_msg = TelegramFormatter.format_startup_diagnostics(
+        bot_online=True,
+        cache_active=True,
+        learning_active=True,
+        signals_loaded=0,
+    )
+    send_telegram_immediate(MessageType.DIAGNOSTIC, startup_msg)
 
     while True:
         try:
+            # 0) Generate automated signals at 10:00 AM IST
+            now_tz = pd.Timestamp.now(tz="Asia/Kolkata")
+            if now_tz.hour == 10 and last_daily_signal_generation != now_tz.date():
+                generate_daily_signals()
+                last_daily_signal_generation = now_tz.date()
+
             # 1) Update external signal list first.
             message_text = fetch_signal_text_from_telegram()
             if message_text:
@@ -324,6 +306,18 @@ def run():
                 continue
 
             print("Market Open — Running")
+
+            # 2a) Check and perform day reset if needed
+            # This ensures clean state at market open, no stale data from yesterday
+            reset_summary = check_and_perform_reset()
+            if reset_summary:
+                # Day was reset, also generate fresh daily signals
+                from signal_generator import generate_daily_signals
+                generate_daily_signals()
+                # Reset last_daily_signal_generation to avoid duplicate generation
+                last_daily_signal_generation = pd.Timestamp.now(tz="Asia/Kolkata").date()
+                # Reset risk manager daily stats
+                risk_manager.daily_reset()
 
             force_fast_mode = should_force_fast_mode()
 
@@ -361,22 +355,39 @@ def run():
             now_minute_key = now_timestamp.floor("min")
             
             if cached_minute_df is None or cached_minute_time != now_minute_key:
-                if is_api_call_allowed():
-                    cached_minute_df = get_data("1min")
-                    cached_minute_time = now_minute_key
-                else:
-                    cached_minute_df = None
+                cached_minute_df = get_data("1min")
+                cached_minute_time = now_minute_key
 
-            # 4) Run auto bot logic.
-            df = add_indicators(df)
+            # 4) COMPUTE INDICATORS ONCE - use processed_df everywhere
+            # This is the single source of truth for processed market data
+            df = update_processed_df()
+            
+            if df is None:
+                print("Failed to get processed data")
+                time.sleep(sleep_time)
+                continue
+            
             confidence, grade = calculate_score(df)
-            trade_threshold = get_adaptive_trade_threshold(75)
+            
+            # Get dynamic confidence threshold from risk manager
+            market_quality = "normal"  # Could be determined from market conditions
+            required_threshold = risk_manager.get_required_confidence_threshold(market_quality)
+            position_multiplier = risk_manager.get_position_size_multiplier()
+            
+            print(f"[Risk] Mode: {risk_manager.trading_mode.value} | Confidence: {confidence}% | Required: {required_threshold}% | P.Size: {position_multiplier:.1%}")
 
-            # Debug: print final confidence used by bot decision path
-            print(f"FINAL CONFIDENCE USED: {confidence}%")
+            # Check if trade is allowed by risk manager
+            can_trade, risk_reason = risk_manager.can_open_trade(confidence, market_quality)
+            
+            if not can_trade:
+                print(f"[Risk Manager] {risk_reason}")
+                # 5) Run external signal processing after auto bot.
+                run_external_signal_engine(df, cached_minute_df)
+                time.sleep(sleep_time)
+                continue
 
-            if confidence < trade_threshold:
-                print(f"Signal rejected - confidence too low: {confidence}% (threshold {trade_threshold}%)")
+            if confidence < required_threshold:
+                print(f"Signal rejected - confidence too low: {confidence}% (required {required_threshold}%)")
                 # 5) Run external signal processing after auto bot.
                 run_external_signal_engine(df, cached_minute_df)
                 time.sleep(sleep_time)
@@ -405,6 +416,22 @@ def run():
                     time.sleep(sleep_time)
                     continue
 
+                # Market Safety Checks
+                session_ok, session_reason = is_optimal_session()
+                if not session_ok:
+                    print(f"Trade blocked: {session_reason}")
+                    run_external_signal_engine(df, cached_minute_df)
+                    time.sleep(sleep_time)
+                    continue
+
+                # Comprehensive market condition checks
+                market_ok, market_reason = check_market_safety(df, fixed['signal'])
+                if not market_ok:
+                    print(f"Trade blocked - Market safety: {market_reason}")
+                    run_external_signal_engine(df, cached_minute_df)
+                    time.sleep(sleep_time)
+                    continue
+
                 current_candle_time = df.iloc[-1].get("CandleTime", df.index[-1])
 
                 if current_candle_time == last_signal_time:
@@ -415,69 +442,62 @@ def run():
 
                 print("Score:", confidence, grade)
 
-                send_telegram(f"""
-*PRE-SIGNAL*
-
-*Market:* EUR/USD
-*Signal:* {fixed['signal']}
-
-*Score*
-Grade: {grade}
-Confidence: {confidence}%
-
-*Fixed Trade*
-Entry: {fixed['entry']}
-Starts In: {fixed['seconds_left']//60} min
-
-Waiting for confirmation.
-""")
+                # Get current session for display
+                current_session = get_current_session()
+                
+                # Send pre-signal using new formatter
+                pre_signal_msg = TelegramFormatter.format_pre_signal(
+                    pair="EUR/USD",
+                    direction=fixed['signal'],
+                    confidence=confidence,
+                    entry=str(fixed['entry']),
+                    time=f"{fixed['seconds_left']//60} min",
+                    source="auto_trade",
+                )
+                send_telegram_queued(MessageType.PRE_SIGNAL, pre_signal_msg, priority=3)
 
                 forex = get_forex_signal(df, fixed["signal"], confidence)
 
                 confirm = fixed
 
-                msg = f"""
-*CONFIRMED SIGNAL*
-
-*Market:* EUR/USD
-*Direction:* {forex['direction']}
-
-*Score*
-Grade: {grade}
-Confidence: {confidence}%
-
-*Fixed Trade*
-Entry: {confirm['entry']}
-Expiry: {confirm['expiry']}
-
-*Forex Trade*
-Entry: {forex['entry']}
-Entry Window: {forex['entry_window']}
-Hold: {forex['hold']}
-
-*Risk Targets*
-TP: {forex['tp']}
-SL: {forex['sl']}
-Multiplier: {forex['multiplier']}
-Auto Close: {forex['auto_close']}
-"""
-
-                print(msg)
-                send_telegram(msg)
+                # Send confirmed signal using new formatter
+                confirmed_msg = TelegramFormatter.format_confirmed_signal(
+                    pair="EUR/USD",
+                    direction=forex['direction'],
+                    confidence=confidence,
+                    entry=str(confirm['entry']),
+                    expiry=str(confirm['expiry']),
+                    tp=str(forex['tp']),
+                    sl=str(forex['sl']),
+                    source="auto_trade",
+                )
+                send_telegram_queued(MessageType.CONFIRMED, confirmed_msg, priority=2)
+                
                 try:
+                    # Record trade opening in risk manager
+                    risk_manager.record_trade_open(confidence)
+                    
                     entry_price = float(df.iloc[-1]["Close"])
                     expiry_time = pd.Timestamp.now(tz="Asia/Kolkata") + pd.Timedelta(minutes=5)
+                    signal_time = pd.Timestamp.now(tz="Asia/Kolkata")
 
-                    store_tracked_signal(
-                        signal_time=pd.Timestamp.now(tz="Asia/Kolkata"),
-                        direction=forex["direction"],
-                        entry_price=entry_price,
-                        expiry_time=expiry_time,
-                        signal_type="auto_trade",
+                    
+                    # Create smart signal with full lifecycle management
+                    signal = create_signal(
                         pair="EURUSD",
+                        direction=forex["direction"],
+                        signal_time=signal_time,
+                        expiry_time=expiry_time,
+                        entry_price=entry_price,
+                        stop_loss=forex['sl'],
+                        take_profit=forex['tp'],
                         confidence=confidence,
-                        df=df,
+                        rsi=float(df.iloc[-1]["RSI"]) if "RSI" in df.columns else None,
+                        atr=float(df.iloc[-1]["ATR"]) if "ATR" in df.columns else None,
+                        source="auto_trade",
                     )
+                    print(f"Smart Signal created: {signal.id} - Status: {signal.status.value}")
+                    
                 except Exception as e:
                     print("Tracking error:", e)
 
@@ -489,6 +509,57 @@ Auto Close: {forex['auto_close']}
 
             # 5) Process external signal list with the same df.
             run_external_signal_engine(df, cached_minute_df)
+            
+            # 6) Process smart signal lifecycle - check entries and exits
+            try:
+                current_price = float(df.iloc[-1]["Close"])
+                now = pd.Timestamp.now(tz="Asia/Kolkata")
+                closed_signals = process_signals(current_price, now)
+                
+                # Report closed signals and record in risk manager
+                for signal in closed_signals:
+                    result_emoji = "✅" if signal.result.value == "win" else "❌"
+                    print(f"{result_emoji} Signal {signal.id[:20]}... closed: {signal.result.value}")
+                    
+                    # Record trade close in risk manager
+                    if signal.exit and signal.entry:
+                        profit_pips = signal.exit.profit_pips
+                        original_confidence = signal.confidence
+                        
+                        # Calculate profit/loss in pips
+                        risk_manager.record_trade_close(profit_pips, original_confidence)
+                        
+                        # Check if safe mode should be activated
+                        risk_status = risk_manager.get_status()
+                        if risk_status['consecutive_losses'] >= 2 and not (risk_manager.trading_mode.value == 'safe_mode'):
+                            risk_manager.activate_safe_mode(f"Consecutive losses: {risk_status['consecutive_losses']}")
+                    
+                    # Send result notification using new formatter
+                    if signal.exit:
+                        result_msg = TelegramFormatter.format_result(
+                            pair=signal.pair,
+                            direction=signal.direction,
+                            result=signal.result.value,
+                            entry=str(signal.entry.entry_price if signal.entry else 'N/A'),
+                            exit=str(signal.exit.exit_price),
+                            profit_pips=signal.exit.profit_pips,
+                            reason=signal.exit.exit_reason,
+                        )
+                        send_telegram_queued(MessageType.RESULT, result_msg, priority=1)
+                
+                # Print active signals summary and risk status
+                stats = get_signal_stats()
+                if stats['active_count'] > 0:
+                    print(f"Active signals: {stats['active_count']}, Total: {stats['total_signals']}")
+                
+                # Print risk manager status
+                risk_status = risk_manager.get_status()
+                print(f"[Risk Status] {risk_status['daily_trades']}/{risk_manager.config.max_daily_trades} trades | "
+                      f"W/L: {risk_status['daily_wins']}/{risk_status['daily_losses']} | "
+                      f"Mode: {risk_status['mode']} | Net P/L: {risk_status['net_profit_pips']}")
+            except Exception as e:
+                print(f"Signal processing error: {e}")
+            
             time.sleep(sleep_time)
 
         except Exception as e:

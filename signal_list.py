@@ -5,11 +5,56 @@ from datetime import date, datetime, time, timedelta
 import json
 import os
 import re
+import time
 from typing import Callable, List, Optional
+import logging
 
 import pandas as pd
 
+# Simple logging setup - reduce console spam
+LOG_LEVEL = os.getenv("LOG_LEVEL", "WARNING")  # Default to WARNING in production
+logging.basicConfig(level=LOG_LEVEL, format='%(levelname)s: %(message)s')
+logger = logging.getLogger(__name__)
+
+_last_log_time = {}  # Track last log time to reduce spam
+
+def _log_throttle(key: str, min_interval: int = 60) -> bool:
+    """Throttle logging to reduce spam. Returns True if should log."""
+    global _last_log_time
+    now = time.time()
+    if key not in _last_log_time or now - _last_log_time[key] > min_interval:
+        _last_log_time[key] = now
+        return True
+    return False
+
 from indicators import add_indicators
+from market_cache import get_processed_df
+from signal_sources import global_signal_manager
+from confidence_engine import calculate_real_confidence
+from confirmation_engine import validate_live_signal
+import learning_engine
+from martingale_safety import (
+    can_enter_martingale,
+    record_martingale_result,
+    get_martingale_safety_engine,
+    get_martingale_status,
+)
+from market_safety import (
+    check_market_safety,
+    is_optimal_session,
+    get_current_session,
+)
+from news_filter import is_news_blackout, get_news_warning_message, cleanup_old_events
+from market_cache import is_api_safety_mode_active
+from smart_signal_manager import (
+    get_signal_manager,
+    create_signal,
+)
+from telegram_queue import (
+    send_telegram_queued,
+    TelegramFormatter,
+    MessageType,
+)
 
 try:
     from zoneinfo import ZoneInfo
@@ -25,7 +70,7 @@ PRE_SIGNAL_MAX_SECONDS = 120
 MARTINGALE_PREALERT_MIN_SECONDS = 45
 MARTINGALE_PREALERT_MAX_SECONDS = 150
 MARTINGALE_ENTRY_DELAY = timedelta(minutes=2)
-SIGNAL_PATTERN = re.compile(r"^(?P<hour>\d{2}):(?P<minute>\d{2})\s+EURUSD\s+(?P<signal>CALL|PUT)$")
+SIGNAL_PATTERN = re.compile(r"^(?P<hour>\d{2}):(?P<minute>\d{2})\s+EURUSD\s+(?P<signal>CALL|PUT|SKIP)$")
 
 
 @dataclass(frozen=True)
@@ -44,12 +89,25 @@ evaluated_signal_count = 0
 confirmed_signal_count = 0
 ENABLE_MARTINGALE = True
  
-# Result tracking
-tracked_signals: List[dict] = []
-total_trades = 0
-wins = 0
-losses = 0
 last_daily_report_date = None
+
+def reset_daily_state() -> None:
+    """
+    Reset daily state for day change.
+    Called by day_reset module at market open.
+    """
+    global signal_list, processed_signals, last_update_id, last_signal_update_time
+    global evaluated_signal_count, confirmed_signal_count
+    
+    # Clear signals and processing state
+    signal_list.clear()
+    processed_signals.clear()
+    last_update_id = None
+    last_signal_update_time = None
+    evaluated_signal_count = 0
+    confirmed_signal_count = 0
+    
+    print("  ✓ Signal list daily state reset")
 
 
 def _get_timezone():
@@ -69,21 +127,20 @@ def _signal_key(signal_time: datetime, direction: str) -> str:
     return f"{signal_time:%H:%M}_{direction}"
 
 
-def _build_signal_state(entries: List[SignalEntry]) -> List[dict]:
-    return [
-        {
-            "time": entry.signal_time,
-            "pair": entry.pair,
-            "direction": entry.direction,
-            "pre_sent": False,
-            "confirmed_sent": False,
-            "martingale_time": entry.signal_time + MARTINGALE_ENTRY_DELAY,
-            "martingale_prealert_sent": False,
-            "martingale_confirmed_sent": False,
-            "martingale_confidence": 0,
-        }
-        for entry in entries
-    ]
+def _build_signal_state(entries: List[SignalEntry], boost: int, skip: bool) -> dict:
+    return {
+        "time": entries[0].signal_time,
+        "pair": entries[0].pair,
+        "direction": entries[0].direction,
+        "pre_sent": False,
+        "confirmed_sent": False,
+        "martingale_time": entries[0].signal_time + MARTINGALE_ENTRY_DELAY,
+        "martingale_prealert_sent": False,
+        "martingale_confirmed_sent": False,
+        "martingale_confidence": 0,
+        "boost": boost,
+        "skip": skip
+    }
 
 
 def _parse_line(line: str, current_day: date) -> Optional[SignalEntry]:
@@ -126,24 +183,8 @@ def _parse_line(line: str, current_day: date) -> Optional[SignalEntry]:
         return None
 
 
-def load_signal_entries(signal_lines: List[str], current_day: Optional[date] = None) -> List[SignalEntry]:
-    if current_day is None:
-        current_day = _now().date()
-
-    if not signal_lines:
-        return []
-
-    entries: List[SignalEntry] = []
-    for line in signal_lines:
-        entry = _parse_line(line, current_day)
-        if entry is not None:
-            entries.append(entry)
-
-    return entries
-
-
-def update_signal_list(signal_lines: Optional[List[str]] = None, now: Optional[datetime] = None) -> List[dict]:
-    global signal_list, processed_signals, last_update_id, last_signal_update_time, evaluated_signal_count, confirmed_signal_count
+def sync_with_signal_manager(now: Optional[datetime] = None) -> List[dict]:
+    global signal_list, processed_signals, last_signal_update_time, evaluated_signal_count, confirmed_signal_count
 
     if now is None:
         now = _now()
@@ -154,50 +195,50 @@ def update_signal_list(signal_lines: Optional[List[str]] = None, now: Optional[d
     if previous_day != current_day:
         signal_list = []
         processed_signals = set()
-        last_update_id = None
         evaluated_signal_count = 0
         confirmed_signal_count = 0
 
-    if signal_lines is None:
-        last_signal_update_time = now
-        return signal_list
-
-    if isinstance(signal_lines, str):
-        signal_lines = signal_lines.splitlines()
-
-    if not isinstance(signal_lines, list):
-        signal_lines = []
-
-    if not signal_lines:
-        signal_list = []
-        processed_signals = set()
-        last_update_id = None
-        evaluated_signal_count = 0
-        confirmed_signal_count = 0
-        last_signal_update_time = now
-        return signal_list
-
-    update_id = f"mem-{current_day.isoformat()}-{len(signal_lines)}-{'|'.join(signal_lines)}"
-
-    if update_id != last_update_id:
-        entries = load_signal_entries(signal_lines, current_day)
-        signal_list = _build_signal_state(entries)
-        processed_signals = set()
-        evaluated_signal_count = 0
-        confirmed_signal_count = 0
-        last_update_id = update_id
-        print("Signal list updated")
-
+    merged_signals = global_signal_manager.get_merged_signals()
+    
+    # Build a dictionary of current signals for easy lookup
+    current_state_map = { _signal_key(sig["time"], sig["direction"]): sig for sig in signal_list }
+    
+    new_signal_list = []
+    
+    for ms in merged_signals:
+        entry = _parse_line(ms["line"], current_day)
+        if entry is None:
+            continue
+            
+        key = _signal_key(entry.signal_time, entry.direction)
+        if key in current_state_map:
+            sig = current_state_map[key]
+            sig["boost"] = ms["boost"]
+            sig["skip"] = ms["skip"]
+            new_signal_list.append(sig)
+        else:
+            new_signal_list.append(_build_signal_state([entry], ms["boost"], ms["skip"]))
+            
+    signal_list = new_signal_list
     last_signal_update_time = now
     return signal_list
 
 
 def apply_signal_text(signal_text: str, now: Optional[datetime] = None) -> List[dict]:
+    from signal_sources import SignalSource
     if not isinstance(signal_text, str):
-        return update_signal_list([], now)
+        return sync_with_signal_manager(now)
 
     lines = [line.strip() for line in signal_text.splitlines() if line.strip()]
-    return update_signal_list(lines, now)
+    if lines:
+        global_signal_manager.add_signals(lines, SignalSource.EXTERNAL)
+    return sync_with_signal_manager(now)
+
+def update_signal_list(signal_lines: Optional[List[str]] = None, now: Optional[datetime] = None) -> List[dict]:
+    from signal_sources import SignalSource
+    if signal_lines:
+        global_signal_manager.add_signals(signal_lines, SignalSource.INTERNAL)
+    return sync_with_signal_manager(now)
 
 
 def should_force_fast_mode(now: Optional[datetime] = None, window_seconds: int = 180) -> bool:
@@ -227,133 +268,23 @@ def should_force_fast_mode(now: Optional[datetime] = None, window_seconds: int =
     return False
 
 
+# DEPRECATED: This validation logic is now handled in _check_safety_rules()
+# Kept for backward compatibility - returns True always
 def validate_sniper_signal(df: pd.DataFrame, direction: str) -> bool:
-    if df is None or len(df) < 200:
-        return False
-
-    df = add_indicators(df)
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
-
-    required_values = [
-        last["EMA50"],
-        last["EMA200"],
-        last["RSI"],
-        prev["RSI"],
-        last["ATR"],
-        df["ATR"].mean(),
-    ]
-    if any(pd.isna(value) for value in required_values):
-        return False
-
-    atr = float(last["ATR"])
-    atr_mean = float(df["ATR"].mean())
-    candle_size = abs(float(last["Close"]) - float(last["Open"]))
-    avg_candle = (df["Close"] - df["Open"]).abs().tail(10).mean()
-    distance = abs(float(last["Close"]) - float(last["EMA50"]))
-
-    trend_threshold = max(0.0002, atr * 0.15)
-    ema_distance_threshold = max(0.0003, atr * 0.50)
-
-    if direction == "CALL":
-        trend_ok = last["EMA50"] > last["EMA200"]
-        rsi_ok = last["RSI"] > prev["RSI"]
-    else:
-        trend_ok = last["EMA50"] < last["EMA200"]
-        rsi_ok = last["RSI"] < prev["RSI"]
-
-    if not trend_ok:
-        return False
-    if abs(float(last["EMA50"]) - float(last["EMA200"])) <= trend_threshold:
-        return False
-    if not rsi_ok:
-        return False
-    if atr <= atr_mean:
-        return False
-    if candle_size <= float(avg_candle):
-        return False
-    if distance > ema_distance_threshold:
-        return False
-
     return True
 
 
+# DEPRECATED: Martingale validation now handled by martingale_safety.py
 def validate_martingale_signal(df: pd.DataFrame, direction: str) -> bool:
-    if not validate_sniper_signal(df, direction):
-        return False
-
-    df = add_indicators(df)
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
-
-    if direction == "CALL":
-        if last["RSI"] <= 60:
-            return False
-        if last["RSI"] <= prev["RSI"]:
-            return False
-        if float(last["Close"]) <= float(last["Open"]):
-            return False
-    else:
-        if last["RSI"] >= 40:
-            return False
-        if last["RSI"] >= prev["RSI"]:
-            return False
-        if float(last["Close"]) >= float(last["Open"]):
-            return False
-
     return True
 
-
-def calculate_confidence(df: pd.DataFrame, direction: str) -> int:
-    df = add_indicators(df)
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
-    atr = float(last["ATR"]) if not pd.isna(last.get("ATR")) else 0.0
-    atr_mean = float(df["ATR"].mean()) if not pd.isna(df["ATR"].mean()) else 0.0
-    candle_size = abs(float(last["Close"]) - float(last["Open"]))
-    avg_candle = float((df["Close"] - df["Open"]).abs().tail(10).mean())
-    distance = abs(float(last["Close"]) - float(last["EMA50"]))
-
-    score = 0
-    # EMA Trend: +25
-    if direction == "CALL":
-        if last["EMA50"] > last["EMA200"]:
-            score += 25
-    else:
-        if last["EMA50"] < last["EMA200"]:
-            score += 25
-
-    # RSI Movement: +15
-    if direction == "CALL":
-        rsi = float(last["RSI"])
-        rsi_prev = float(prev["RSI"])
-        if rsi > 55 and rsi > rsi_prev:
-            score += 15
-    else:
-        rsi = float(last["RSI"])
-        rsi_prev = float(prev["RSI"])
-        if rsi < 45 and rsi < rsi_prev:
-            score += 15
-
-    # ATR Strength: +15
-    if atr > atr_mean:
-        score += 15
-
-    # Candle Strength: +10
-    if candle_size > avg_candle:
-        score += 10
-
-    # Distance: +10 (if close to EMA50)
-    if distance <= max(0.0003, atr * 0.50):
-        score += 10
-
-    # Score now maxes at 75 based on weights above; scale to percentage and cap at 90%
-    confidence = int((score / 75) * 85)
-    return min(confidence, 90)
 
 
 def build_forex_targets(df: pd.DataFrame, direction: str, confidence: int) -> tuple[float, float, float]:
-    df = add_indicators(df)
+    df = get_processed_df()
+    if df is None or len(df) < 200:
+        return 0.0, 0.0, 0.0
+    
     last = df.iloc[-1]
     atr = float(last["ATR"])
     entry = float(last["Close"])
@@ -439,130 +370,158 @@ def _get_candle_strength(df: pd.DataFrame) -> str:
         return "Strong 💪"
 
 
-def _build_pre_message(signal: dict, confidence: int, df: pd.DataFrame) -> str:
-    """Build pre-signal message with full indicator analysis."""
-    last = df.iloc[-1]
-    rsi = float(last["RSI"]) if not pd.isna(last["RSI"]) else 0
-    ema_trend = _get_ema_trend(df, signal['direction'])
-    rsi_interp = _get_rsi_interpretation(rsi)
-    atr_strength = _get_atr_strength(df)
-    candle_strength = _get_candle_strength(df)
-    
-    return (
-        f"📊 *PRE-SIGNAL*\n\n"
-        f"Pair: {signal['pair']}\n"
-        f"Direction: {signal['direction']}\n"
-        f"Time: {signal['time']:%H:%M}\n\n"
-        f"Confidence: {confidence}%\n\n"
-        f"*Technical Analysis*\n"
-        f"EMA Trend: {ema_trend}\n"
-        f"RSI: {rsi:.0f} ({rsi_interp})\n"
-        f"ATR: {atr_strength}\n"
-        f"Candle Strength: {candle_strength}\n\n"
-        f"Status: Preparing for entry ⏳"
+def _build_pre_message(signal: dict, confidence: int, df: pd.DataFrame, source: str = "direct") -> str:
+    """Build pre-signal message using new TelegramFormatter."""
+    return TelegramFormatter.format_pre_signal(
+        pair=signal['pair'],
+        direction=signal['direction'],
+        confidence=confidence,
+        entry="Pending",
+        time=f"{signal['time']:%H:%M}",
+        source=source,
     )
 
 
-def _build_confirm_message(signal: dict, confidence: int, expiry: datetime, tp: float, sl: float, df: pd.DataFrame) -> str:
-    """Build confirmed signal message with full indicator analysis."""
-    last = df.iloc[-1]
-    rsi = float(last["RSI"]) if not pd.isna(last["RSI"]) else 0
-    ema_trend = _get_ema_trend(df, signal['direction'])
-    rsi_interp = _get_rsi_interpretation(rsi)
-    atr_strength = _get_atr_strength(df)
-    candle_strength = _get_candle_strength(df)
-    
-    # Determine signal quality based on confidence
-    if confidence >= 85:
-        signal_quality = "HIGH PROBABILITY TRADE ✅"
-    elif confidence >= 75:
-        signal_quality = "STRONG SIGNAL ✅"
-    else:
-        signal_quality = "VALID SIGNAL ✓"
-    
-    return (
-        f"📊 *SIGNAL CONFIRMED*\n\n"
-        f"Pair: {signal['pair']}\n"
-        f"Direction: {signal['direction']}\n\n"
-        f"Confidence: {confidence}%\n\n"
-        f"*Technical Analysis*\n"
-        f"EMA Trend: {ema_trend}\n"
-        f"RSI: {rsi:.0f} ({rsi_interp})\n"
-        f"ATR: {atr_strength}\n"
-        f"Candle Strength: {candle_strength}\n\n"
-        f"*Trade Details*\n"
-        f"Entry Time: {signal['time']:%H:%M}\n"
-        f"Expiry: {expiry:%H:%M}\n"
-        f"TP: {tp}\n"
-        f"SL: {sl}\n\n"
-        f"Decision: {signal_quality}"
+def _build_confirm_message(signal: dict, confidence: int, expiry: datetime, tp: float, sl: float, df: pd.DataFrame, source: str = "direct") -> str:
+    """Build confirmed signal message using new TelegramFormatter."""
+    return TelegramFormatter.format_confirmed_signal(
+        pair=signal['pair'],
+        direction=signal['direction'],
+        confidence=confidence,
+        entry=f"{signal['time']:%H:%M}",
+        expiry=f"{expiry:%H:%M}",
+        tp=f"{tp}",
+        sl=f"{sl}",
+        source=source,
     )
 
 
 def _check_safety_rules(df: pd.DataFrame, direction: str, confidence: int) -> tuple[bool, str]:
+    # ── Global safety gates (always enforced, cannot be bypassed) ──
+    # 1. API failure safety mode
+    if is_api_safety_mode_active():
+        return False, "API safety mode active — stale data"
+
+    # 2. News blackout window
+    blackout, blackout_reason = is_news_blackout()
+    if blackout:
+        return False, blackout_reason
+
     if confidence < 70:
         return False, "confidence below 70"
 
     if df is None or len(df) < 200:
         return False, "insufficient data"
 
-    df = add_indicators(df)
+    df = get_processed_df()
+    if df is None or len(df) < 200:
+        return False, "insufficient data"
+
     last = df.iloc[-1]
     prev = df.iloc[-2]
+    prev2 = df.iloc[-3]
+    lookback_5 = df.iloc[-5]
 
     required_values = [
-        last["EMA50"],
-        last["EMA200"],
-        last["RSI"],
-        prev["RSI"],
-        last["ATR"],
-        df["ATR"].mean(),
+        last["EMA50"], last["EMA200"], last["RSI"], prev["RSI"], last["ATR"]
     ]
     if any(pd.isna(value) for value in required_values):
         return False, "indicator values unavailable"
 
     atr = float(last["ATR"])
     atr_mean = float(df["ATR"].mean())
-    trend_gap = abs(float(last["EMA50"]) - float(last["EMA200"]))
-    trend_threshold = max(0.0002, atr * 0.15)
     rsi_value = float(last["RSI"])
+    rsi_prev = float(prev["RSI"])
 
-    # Overbought/Oversold protection
-    if direction == "CALL" and rsi_value >= 68:
-        return False, "RSI overbought, reject CALL"
-    if direction == "PUT" and rsi_value <= 32:
-        return False, "RSI oversold, reject PUT"
+    # ── High-Confidence Fast Mode: bypass soft secondary filters at ≥82 ──
+    fast_mode = confidence >= 82
+
+    # 1. HARD REJECTION ZONES (always enforced)
+    if direction == "CALL" and rsi_value > 78:
+        return False, "RSI > 78 (Hard Rejection)"
+    if direction == "PUT" and rsi_value < 22:
+        return False, "RSI < 22 (Hard Rejection)"
+
+    # 2. RSI MOMENTUM & STRONG ZONES — relaxed further
+    if direction == "CALL":
+        if rsi_value <= rsi_prev and not fast_mode:
+            return False, "RSI momentum not increasing"
+        if rsi_value < 52 and not fast_mode:  # was 55 — relaxed further to 52
+            return False, f"RSI {rsi_value:.1f} < 52 (Weak Zone)"
+    else:
+        if rsi_value >= rsi_prev and not fast_mode:
+            return False, "RSI momentum not decreasing"
+        if rsi_value > 48 and not fast_mode:  # was 45 — relaxed further to 48
+            return False, f"RSI {rsi_value:.1f} > 45 (Weak Zone)"
+
+    # 3. EMA SLOPE DETECTION
+    ema50 = float(last["EMA50"])
+    ema50_prev = float(prev["EMA50"])
+    ema50_prev2 = float(prev2["EMA50"])
 
     if direction == "CALL":
+        if not (ema50 > ema50_prev) and not fast_mode:
+            return False, "EMA50 not rising"
+    else:
+        if not (ema50 < ema50_prev) and not fast_mode:
+            return False, "EMA50 not falling"
+
+    # 4. DIVERGENCE REJECTION - relaxed significantly
+    close_now = float(last["Close"])
+    close_5 = float(lookback_5["Close"])
+    rsi_5 = float(lookback_5["RSI"])
+    
+    # Only reject strong divergence in non-fast mode
+    if direction == "CALL":
+        if close_now > close_5 * 1.005 and rsi_value < rsi_5 - 10 and not fast_mode:  # was close_now > close_5
+            return False, "Strong Bearish Divergence"
+    else:
+        if close_now < close_5 * 0.995 and rsi_value > rsi_5 + 10 and not fast_mode:  # was close_now < close_5
+            return False, "Strong Bullish Divergence"
+
+    # Distance to EMA - relaxed significantly
+    distance_to_ema = abs(close_now - ema50)
+    if distance_to_ema > (atr * 5.0) and not fast_mode:  # was 3.5
+        return False, "Price far from EMA50"
+
+    # Candle exhaustion - relaxed
+    candle_size = abs(close_now - float(last["Open"]))
+    avg_candle = float((df["Close"] - df["Open"]).abs().tail(10).mean())
+    if candle_size > (avg_candle * 4.5) and not fast_mode:  # was 3.0
+        return False, "Large blow-off candle"
+
+    # 6. BASIC TREND CHECK vs EMA200 - relaxed
+    trend_gap = abs(float(last["EMA50"]) - float(last["EMA200"]))
+    trend_threshold = max(0.00010, atr * 0.08)  # was 0.00015 / 0.12
+    
+    if direction == "CALL":
         trend_direction_ok = float(last["EMA50"]) > float(last["EMA200"])
-        rsi_opposite_extreme = rsi_value < 35
     else:
         trend_direction_ok = float(last["EMA50"]) < float(last["EMA200"])
-        rsi_opposite_extreme = rsi_value > 65
 
-    if not trend_direction_ok or trend_gap <= trend_threshold:
-        return False, "trend unclear"
+    # Only reject completely reversed trend in non-fast mode
+    if not trend_direction_ok and not fast_mode:
+        return False, "trend reversed vs EMA200"
+    
+    # Remove flat trend rejection - allow more setups
+    
+    # Weak ATR — relaxed significantly
+    if atr <= atr_mean * 0.35 and not fast_mode:  # was 0.5
+        return False, "very weak volatility"
 
-    if rsi_opposite_extreme:
-        return False, "RSI extreme opposite"
-
-    if direction == "CALL" and rsi_value < 55:
-        return False, "RSI weak zone"
-    if direction == "PUT" and rsi_value > 45:
-        return False, "RSI weak zone"
-
-    if atr <= atr_mean:
-        return False, "low volatility"
-
-    return True, "safety passed"
+    mode_tag = " [FastMode]" if fast_mode else ""
+    return True, f"safety passed{mode_tag}"
 
 
-def _is_strong_martingale(df: pd.DataFrame, direction: str) -> bool:
-    if not validate_martingale_signal(df, direction):
+def _is_strong_martingale(df: pd.DataFrame, direction: str, confidence: int, signal_key: str, now: datetime) -> bool:
+    """
+    Check if martingale is safe using the comprehensive safety engine.
+    """
+    allowed, reason = can_enter_martingale(df, direction, confidence, signal_key, now)
+    if not allowed:
+        # Only log occasionally to reduce spam
         return False
-
-    confidence = calculate_confidence(df, direction)
-    return confidence >= 75
+    return True
 
 
 def _should_take_signal(df: pd.DataFrame, direction: str, confidence: int, is_next_signal: bool) -> tuple[bool, str]:
@@ -570,8 +529,8 @@ def _should_take_signal(df: pd.DataFrame, direction: str, confidence: int, is_ne
     if not safety_ok:
         return False, safety_reason
 
-    # First signal is strict: only high-confidence entries.
-    base_threshold = 70 if is_next_signal else 75
+    # First signal is strict: only high-confidence entries - relaxed slightly
+    base_threshold = 68 if is_next_signal else 73
     threshold = get_adaptive_trade_threshold(base_threshold)
 
     if confidence >= threshold:
@@ -587,16 +546,6 @@ def _is_trade_direction(direction: str) -> bool:
     return str(direction).upper() in {"CALL", "BUY"}
 
 
-def _get_resolved_trades() -> List[dict]:
-    return [entry for entry in tracked_signals if entry.get("resolved")]
-
-
-def _get_recent_resolved_trades(limit: int = 10) -> List[dict]:
-    resolved = _get_resolved_trades()
-    resolved.sort(key=lambda entry: entry.get("signal_time") or datetime.min)
-    return resolved[-limit:]
-
-
 def _confidence_bucket(confidence: float) -> str:
     if confidence >= 80:
         return ">=80"
@@ -605,133 +554,17 @@ def _confidence_bucket(confidence: float) -> str:
     return "<70"
 
 
-def _win_rate(trades: List[dict]) -> float:
-    if not trades:
-        return 0.0
-    wins_count = sum(1 for trade in trades if trade.get("result") == "WIN")
-    return (wins_count / len(trades)) * 100
-
-
 def get_trade_performance() -> dict:
-    resolved = _get_resolved_trades()
-    resolved_total = len(resolved)
-    resolved_wins = sum(1 for trade in resolved if trade.get("result") == "WIN")
-    resolved_losses = sum(1 for trade in resolved if trade.get("result") == "LOSS")
-    overall_win_rate = (resolved_wins / resolved_total * 100) if resolved_total else 0.0
-
-    confidence_buckets = {">=80": [], "70-79": [], "<70": []}
-    for trade in resolved:
-        confidence = trade.get("confidence")
-        if confidence is None:
-            continue
-        confidence_buckets[_confidence_bucket(float(confidence))].append(trade)
-
-    bucket_stats = {}
-    for bucket, trades in confidence_buckets.items():
-        bucket_total = len(trades)
-        bucket_wins = sum(1 for trade in trades if trade.get("result") == "WIN")
-        bucket_stats[bucket] = {
-            "total": bucket_total,
-            "wins": bucket_wins,
-            "losses": bucket_total - bucket_wins,
-            "win_rate": (bucket_wins / bucket_total * 100) if bucket_total else 0.0,
-        }
-
-    recent_10 = _get_recent_resolved_trades(10)
-
-    return {
-        "total_trades": resolved_total,
-        "wins": resolved_wins,
-        "losses": resolved_losses,
-        "win_rate": overall_win_rate,
-        "recent_10_win_rate": _win_rate(recent_10),
-        "confidence_buckets": bucket_stats,
-    }
+    """Wrapper for SmartSignalManager stats to maintain compatibility."""
+    from smart_signal_manager import get_signal_stats
+    return get_signal_stats()
 
 
 def get_adaptive_trade_threshold(base_threshold: int = 70) -> int:
-    recent_10 = _get_recent_resolved_trades(10)
-    if not recent_10:
-        return base_threshold
-
-    recent_win_rate = _win_rate(recent_10)
-    if recent_win_rate < 50:
-        return base_threshold + 5
-    if recent_win_rate > 70:
-        return 70
-    return base_threshold
+    return learning_engine.adapt_confidence_threshold(base_threshold)
 
 
-def _save_tracked_signals_to_json() -> None:
-    """Save tracked_signals to JSON file for persistence across restarts."""
-    try:
-        json_data = []
-        for signal in tracked_signals:
-            data = dict(signal)
-            # Convert datetime objects to ISO format strings
-            if "signal_time" in data and isinstance(data["signal_time"], datetime):
-                data["signal_time"] = data["signal_time"].isoformat()
-            if "expiry_time" in data and isinstance(data["expiry_time"], datetime):
-                data["expiry_time"] = data["expiry_time"].isoformat()
-            json_data.append(data)
-        
-        with open("tracked_signals.json", "w") as f:
-            json.dump(json_data, f, indent=2)
-    except Exception as e:
-        print(f"Error saving tracked signals to JSON: {e}")
 
-
-def _load_tracked_signals_from_json() -> None:
-    """Load tracked_signals from JSON file on startup."""
-    global tracked_signals
-    try:
-        if os.path.exists("tracked_signals.json"):
-            with open("tracked_signals.json", "r") as f:
-                json_data = json.load(f)
-                for data in json_data:
-                    # Convert ISO format strings back to datetime objects
-                    if "signal_time" in data and isinstance(data["signal_time"], str):
-                        data["signal_time"] = datetime.fromisoformat(data["signal_time"])
-                    if "expiry_time" in data and isinstance(data["expiry_time"], str):
-                        data["expiry_time"] = datetime.fromisoformat(data["expiry_time"])
-                    tracked_signals.append(data)
-            print(f"Loaded {len(tracked_signals)} tracked signals from JSON")
-    except Exception as e:
-        print(f"Error loading tracked signals from JSON: {e}")
-
-
-def store_tracked_signal(
-    signal_time: datetime,
-    direction: str,
-    entry_price: float,
-    expiry_time: datetime,
-    signal_type: str,
-    pair: str,
-    confidence: float,
-    df: pd.DataFrame,
-) -> None:
-    global tracked_signals
-    last = df.iloc[-1]
-    tracked_signals.append({
-        "signal_time": signal_time,
-        "direction": direction,
-        "entry_price": float(entry_price),
-        "expiry_time": expiry_time,
-        "signal_type": signal_type,
-        "pair": pair,
-        "confidence": float(confidence),
-        "rsi": float(last["RSI"]) if not pd.isna(last["RSI"]) else None,
-        "atr": float(last["ATR"]) if not pd.isna(last["ATR"]) else None,
-        "ema_trend": _get_ema_trend(df, direction),
-        "resolved": False,
-    })
-
-    # Memory management: keep only last 200 trades
-    if len(tracked_signals) > 200:
-        tracked_signals[:] = tracked_signals[-200:]
-    
-    # Save to JSON for persistence
-    _save_tracked_signals_to_json()
 
 
 
@@ -756,9 +589,11 @@ def _maybe_build_daily_report(now: datetime) -> Optional[str]:
     if last_daily_report_date == report_date:
         return None
 
+    from smart_signal_manager import get_signal_manager
+    mgr = get_signal_manager()
     resolved_for_day = [
-        trade for trade in _get_resolved_trades()
-        if trade.get("signal_time") is not None and trade["signal_time"].date() == report_date
+        sig for sig in mgr.signals.values()
+        if sig.resolved and sig.signal_time.date() == report_date
     ]
 
     if not resolved_for_day:
@@ -766,104 +601,54 @@ def _maybe_build_daily_report(now: datetime) -> Optional[str]:
 
     day_stats = {
         "total_trades": len(resolved_for_day),
-        "wins": sum(1 for trade in resolved_for_day if trade.get("result") == "WIN"),
-        "losses": sum(1 for trade in resolved_for_day if trade.get("result") == "LOSS"),
+        "wins": sum(1 for sig in resolved_for_day if sig.result == "WIN"),
+        "losses": sum(1 for sig in resolved_for_day if sig.result == "LOSS"),
     }
     day_stats["win_rate"] = (day_stats["wins"] / day_stats["total_trades"] * 100) if day_stats["total_trades"] else 0.0
-    day_stats["best_trades"] = sum(1 for trade in resolved_for_day if float(trade.get("confidence") or 0) >= 80 and trade.get("result") == "WIN")
+    day_stats["best_trades"] = sum(1 for sig in resolved_for_day if sig.confidence >= 80 and sig.result == "WIN")
 
     last_daily_report_date = report_date
 
-    return (
-        f"📊 Performance Report\n"
-        f"Total Trades: {day_stats['total_trades']}\n"
-        f"Wins: {day_stats['wins']}\n"
-        f"Losses: {day_stats['losses']}\n"
-        f"Win Rate: {day_stats['win_rate']:.1f}%\n"
-        f"Best Trades: {day_stats['best_trades']}"
+    # Add safety engine status to report
+    safety_status = get_martingale_status()
+    
+    # Use new TelegramFormatter for daily report
+    return TelegramFormatter.format_daily_report(
+        date=f"{report_date:%Y-%m-%d}",
+        total=day_stats['total_trades'],
+        wins=day_stats['wins'],
+        losses=day_stats['losses'],
+        win_rate=day_stats['win_rate'],
+        safety_status=safety_status,
     )
 
 
 def _build_mg_pre_message(signal: dict, confidence: int, df: pd.DataFrame) -> str:
-    """Build martingale pre-alert message with indicator analysis."""
-    last = df.iloc[-1]
-    rsi = float(last["RSI"]) if not pd.isna(last["RSI"]) else 0
-    ema_trend = _get_ema_trend(df, signal['direction'])
-    rsi_interp = _get_rsi_interpretation(rsi)
-    atr_strength = _get_atr_strength(df)
-    candle_strength = _get_candle_strength(df)
-    
-    return (
-        f"🎲 *MARTINGALE PRE-ALERT*\n\n"
-        f"Pair: {signal['pair']}\n"
-        f"Direction: {signal['direction']}\n"
-        f"Time: {signal['martingale_time']:%H:%M}\n\n"
-        f"Confidence: {confidence}%\n\n"
-        f"*Technical Analysis*\n"
-        f"EMA Trend: {ema_trend}\n"
-        f"RSI: {rsi:.0f} ({rsi_interp})\n"
-        f"ATR: {atr_strength}\n"
-        f"Candle Strength: {candle_strength}\n\n"
-        f"Status: Ready for martingale entry"
+    """Build martingale pre-alert message using TelegramFormatter."""
+    return TelegramFormatter.format_pre_signal(
+        pair=signal['pair'],
+        direction=signal['direction'],
+        confidence=confidence,
+        entry="Pending",
+        time=f"{signal['martingale_time']:%H:%M}",
+        source="martingale",
     )
 
 
 def _build_mg_confirm_message(signal: dict, confidence: int, expiry: datetime, tp: float, sl: float, df: pd.DataFrame) -> str:
-    """Build martingale confirmed message with indicator analysis."""
-    last = df.iloc[-1]
-    rsi = float(last["RSI"]) if not pd.isna(last["RSI"]) else 0
-    ema_trend = _get_ema_trend(df, signal['direction'])
-    rsi_interp = _get_rsi_interpretation(rsi)
-    atr_strength = _get_atr_strength(df)
-    candle_strength = _get_candle_strength(df)
-    
-    return (
-        f"🎲 *MARTINGALE CONFIRMED*\n\n"
-        f"Pair: {signal['pair']}\n"
-        f"Direction: {signal['direction']}\n\n"
-        f"Confidence: {confidence}%\n\n"
-        f"*Technical Analysis*\n"
-        f"EMA Trend: {ema_trend}\n"
-        f"RSI: {rsi:.0f} ({rsi_interp})\n"
-        f"ATR: {atr_strength}\n"
-        f"Candle Strength: {candle_strength}\n\n"
-        f"*Trade Details*\n"
-        f"Entry Time: {signal['martingale_time']:%H:%M}\n"
-        f"Expiry: {expiry:%H:%M}\n"
-        f"TP: {tp}\n"
-        f"SL: {sl}\n\n"
-        f"Decision: ENTERING MARTINGALE ✅"
+    """Build martingale confirmed message using TelegramFormatter."""
+    return TelegramFormatter.format_confirmed_signal(
+        pair=signal['pair'],
+        direction=signal['direction'],
+        confidence=confidence,
+        entry=f"{signal['martingale_time']:%H:%M}",
+        expiry=f"{expiry:%H:%M}",
+        tp=f"{tp}",
+        sl=f"{sl}",
+        source="martingale",
     )
 
 
-def _format_result_message(entry: dict) -> str:
-    """Format result message for a finished trade."""
-    pair = entry.get("pair", "EURUSD")
-    direction = entry.get("direction")
-    entry_price = entry.get("entry_price")
-    final_price = entry.get("final_price")
-    result = entry.get("result")
-
-    outcome = "✅ WIN" if result == "WIN" else "❌ LOSS"
-
-    return (
-        f"📊 RESULT\n\n"
-        f"Pair: {pair}\n"
-        f"Direction: {direction}\n\n"
-        f"Entry: {entry_price:.5f}\n"
-        f"Exit: {final_price:.5f}\n\n"
-        f"Result: {outcome}"
-    )
-
-
-def _update_stats(entry: dict):
-    """Update global stats based on a finished trade."""
-    global total_trades, wins, losses
-    total_trades += 1
-    if entry.get("result") == "WIN":
-        wins += 1
-    else:
-        losses += 1
 
 
 def process_signal_list(
@@ -871,12 +656,6 @@ def process_signal_list(
     minute_data_fetcher: Optional[Callable[[], Optional[pd.DataFrame]]] = None,
 ) -> List[str]:
     global signal_list, processed_signals, evaluated_signal_count, confirmed_signal_count
-    global tracked_signals, total_trades, wins, losses
-
-    # Load tracked signals from JSON on first call
-    if not hasattr(process_signal_list, "_initialized"):
-        _load_tracked_signals_from_json()
-        process_signal_list._initialized = True
 
     if df is None or len(df) < 200:
         return []
@@ -888,6 +667,9 @@ def process_signal_list(
     if daily_report:
         messages.append(daily_report)
 
+    # Get trade stats once for the loop
+    trade_stats = get_trade_performance()
+
     # Fetch 1-minute data ONCE and reuse for all operations
     minute_df = None
     if minute_data_fetcher is not None:
@@ -898,50 +680,7 @@ def process_signal_list(
         except Exception:
             minute_df = None
 
-    # 1) Check for any tracked signals that have expired and report results
-    try:
-        for entry in list(tracked_signals):
-            if entry.get("resolved"):
-                continue
-            expiry = entry.get("expiry_time")
-            if expiry is None:
-                continue
-            if expiry <= now:
-                # Use cached 1min data to determine final price; fallback to provided `df`.
-                final_data = None
-                if minute_df is not None and len(minute_df) >= 1:
-                    final_data = minute_df
-                elif df is not None and len(df) >= 1:
-                    final_data = df
-
-                # Ensure a fallback to `df` so result will always be calculated
-                if final_data is None or len(final_data) < 1:
-                    final_data = df
-
-                try:
-                    final_price = float(final_data.iloc[-1]["Close"])
-                except:
-                    final_price = float(df.iloc[-1]["Close"])
-                entry_price = float(entry.get("entry_price"))
-                direction = entry.get("direction")
-
-                if _is_trade_direction(direction):
-                    is_win = final_price > entry_price
-                else:
-                    is_win = final_price < entry_price
-
-                entry["final_price"] = final_price
-                entry["resolved"] = True
-                entry["result"] = "WIN" if is_win else "LOSS"
-
-                # update stats and prepare message
-                _update_stats(entry)
-                messages.append(_format_result_message(entry))
-                
-                # Save updated tracked signals to JSON
-                _save_tracked_signals_to_json()
-    except Exception as e:
-        print(f"Result tracking error: {e}")
+    # 1) Result reporting now handled by bot.py calling smart_signal_manager.process_signals()
 
     for signal in signal_list:
         try:
@@ -954,35 +693,50 @@ def process_signal_list(
                 continue
 
             base_key = _signal_key(signal_time, direction)
+            
+            # Use Learning Engine for confidence penalty instead of hard blocking
+            learning_penalty = 0
+            if not signal.get("skip"):
+                learning_penalty = learning_engine.get_confidence_penalty(signal_time, direction)
+                if learning_penalty >= 25:  # Only skip for extreme penalty
+                    signal["skip"] = True
+                    if _log_throttle(f"learn_skip_{signal_time:%H:%M}", 300):
+                        logger.info(f"Learning penalty: {learning_penalty}% for {signal_time:%H:%M}")
 
-            # Use cached 1-minute data for PRE-SIGNAL confidence when available.
+            if signal.get("skip"):
+                if base_key not in processed_signals:
+                    processed_signals.add(base_key)
+                    processed_signals.add(_signal_key(signal["martingale_time"], direction))
+                continue
+
             # Determine whether this is a 'next' signal for thresholding.
             is_next_signal = evaluated_signal_count > 0
-            base_threshold = 70 if is_next_signal else 75
+            base_threshold = 68 if is_next_signal else 73
             threshold = get_adaptive_trade_threshold(base_threshold)
 
-            # Prefer minute-level data for pre-signal calculation; fallback to provided df.
-            pre_df = minute_df if (minute_df is not None and len(minute_df) >= 200) else df
-            pre_confidence = calculate_confidence(pre_df, direction)
+            boost = signal.get("boost", 0)
+
+            # ALWAYS use 5m data (df) for indicator-based calculations to avoid fake/high con from 1m noise.
+            pre_confidence = calculate_real_confidence(df, direction, boost, trade_stats)
+            
+            # Apply learning engine penalty to reduce confidence instead of blocking
+            if learning_penalty > 0:
+                pre_confidence = max(0, pre_confidence - learning_penalty)
 
             seconds_to_entry = (signal_time - now).total_seconds()
-            if PRE_SIGNAL_MIN_SECONDS <= seconds_to_entry <= PRE_SIGNAL_MAX_SECONDS and not signal.get("pre_sent"):
-                # Only send pre-signal when the confidence meets the same adaptive threshold
-                if pre_confidence >= threshold:
-                    messages.append(_build_pre_message(signal, pre_confidence, pre_df))
-                    signal["pre_sent"] = True
-                    # Persist the pre-calculated confidence so confirmation uses the same value
-                    signal["pre_confidence"] = pre_confidence
-                    print(f"FINAL CONFIDENCE USED: {pre_confidence}%")
+            # PRE-SIGNALS DISABLED - reduce Telegram noise, only send confirmed signals
+            # if PRE_SIGNAL_MIN_SECONDS <= seconds_to_entry <= PRE_SIGNAL_MAX_SECONDS and not signal.get("pre_sent"):
+            #     if pre_confidence >= threshold:
+            #         messages.append(_build_pre_message(signal, pre_confidence, df))
+            #         signal["pre_sent"] = True
+            #         signal["pre_confidence"] = pre_confidence
+# PRE-SIGNALS DISABLED - reduce Telegram noise, only send confirmed signals
+            # Always store pre_confidence for use in confirmation
+            signal["pre_confidence"] = pre_confidence
 
             if abs((now - signal_time).total_seconds()) <= SIGNAL_WINDOW_SECONDS:
                 if base_key in processed_signals:
                     continue
-
-                signal_df = minute_df
-
-                if signal_df is None or len(signal_df) < 200:
-                    signal_df = df
 
                 # Use any pre-calculated confidence if present so pre-signal and confirmation match.
                 pre_conf = signal.get("pre_confidence")
@@ -990,40 +744,70 @@ def process_signal_list(
                 if pre_conf is not None:
                     confidence = pre_conf
                 else:
-                    confidence = calculate_confidence(signal_df, direction)
+                    confidence = calculate_real_confidence(df, direction, boost, trade_stats)
 
-                # Debug log final confidence used for decision
-                print(f"FINAL CONFIDENCE USED: {confidence}%")
+                # Debug log final confidence used for decision - only throttled
+                if confidence >= 82 and _log_throttle(f"conf_{signal_time:%H:%M}", 180):
+                    logger.info(f"Confidence: {confidence}% for {signal_time:%H:%M} {direction}")
 
                 # Re-check safety rules at confirmation time - if market weakens, skip confirmation
-                should_take, skip_reason = _should_take_signal(signal_df, direction, confidence, is_next_signal)
+                should_take, skip_reason = _should_take_signal(df, direction, confidence, is_next_signal)
 
-                if should_take:
-                    _, tp, sl = build_forex_targets(signal_df, direction, confidence)
+                # Market Safety Checks - session and market conditions
+                session_ok, session_reason = is_optimal_session(now)
+                if not session_ok:
+                    should_take = False
+                    skip_reason = f"Session: {session_reason}"
+                else:
+                    market_ok, market_reason = check_market_safety(df, direction, now)
+                    if not market_ok:
+                        should_take = False
+                        skip_reason = f"Market safety: {market_reason}"
+
+                live_ok = True
+                live_reason = ""
+                if should_take and minute_df is not None:
+                    live_ok, live_reason = validate_live_signal(minute_df, direction, confidence)
+
+                if should_take and live_ok:
+                    _, tp, sl = build_forex_targets(df, direction, confidence)
                     expiry = signal_time + timedelta(minutes=5)
-                    messages.append(_build_confirm_message(signal, confidence, expiry, tp, sl, signal_df))
-                    # Store confirmed signal for result tracking
-                    try:
-                        entry_price = float(signal_df.iloc[-1]["Close"])
-                        store_tracked_signal(
-                            signal_time=signal_time,
-                            direction=direction,
-                            entry_price=entry_price,
-                            expiry_time=expiry,
-                            signal_type="direct",
-                            pair=signal.get("pair", "EURUSD"),
-                            confidence=confidence,
-                            df=signal_df,
-                        )
-                    except Exception as e:
-                        print(f"store_tracked_signal error: {e}")
+                    messages.append(_build_confirm_message(signal, confidence, expiry, tp, sl, df))
+                    
+                    # Smart signal with lifecycle management
+                    create_signal(
+                        pair=signal.get("pair", "EURUSD"),
+                        direction=direction,
+                        signal_time=signal_time,
+                        expiry_time=expiry,
+                        entry_price=float(df.iloc[-1]["Close"]),
+                        stop_loss=sl,
+                        take_profit=tp,
+                        confidence=int(confidence),
+                        auto_trade=True # Allow monitoring/closing for external signals too
+                    )
+                    
                     signal["confirmed_sent"] = True
                     signal["martingale_confidence"] = confidence
                     confirmed_signal_count += 1
-                    print(f"Signal confirmed: {signal_time:%H:%M} {direction}")
+                    if _log_throttle(f"confirm_{signal_time:%H:%M}", 120):
+                        logger.info(f"Signal confirmed: {signal_time:%H:%M} {direction}")
                 else:
                     # Market weakened between pre-signal and confirmation - skip safely
-                    print(f"Skipping confirmation for {signal_time:%H:%M} {direction}: {skip_reason}")
+                    reason = skip_reason if not should_take else live_reason
+                    if _log_throttle(f"skip_{signal_time:%H:%M}", 180):
+                        logger.info(f"Skipped: {signal_time:%H:%M} {direction} - {reason[:50]}")
+                    if signal.get("pre_sent") and not signal.get("skip_sent"):
+                        # Send skip message using new formatter with clear reason
+                        skip_msg = TelegramFormatter.format_skipped_signal(
+                            pair=signal.get("pair", "EURUSD"),
+                            direction=direction,
+                            time=f"{signal_time:%H:%M}",
+                            reason=reason,
+                            confidence=confidence,
+                        )
+                        messages.append(skip_msg)
+                        signal["skip_sent"] = True
 
                 processed_signals.add(base_key)
                 evaluated_signal_count += 1
@@ -1035,58 +819,92 @@ def process_signal_list(
             mg_key = _signal_key(mg_time, direction)
             seconds_to_mg = (mg_time - now).total_seconds()
 
-            if (
-                MARTINGALE_PREALERT_MIN_SECONDS <= seconds_to_mg <= MARTINGALE_PREALERT_MAX_SECONDS
-                and not signal.get("martingale_prealert_sent")
-            ):
-                # Prefer 1-minute data for martingale checks; fallback to main df
-                mg_df = minute_df if (minute_df is not None and len(minute_df) >= 200) else df
-                if _is_strong_martingale(mg_df, direction):
-                    mg_confidence = calculate_confidence(mg_df, direction)
-                    signal["martingale_confidence"] = mg_confidence
-                    messages.append(_build_mg_pre_message(signal, mg_confidence, mg_df))
-                    print(f"FINAL CONFIDENCE USED: {mg_confidence}%")
-                    signal["martingale_prealert_sent"] = True
+            # MARTINGALE PRE-ALERTS DISABLED - reduce Telegram noise
+            # if (
+            #     MARTINGALE_PREALERT_MIN_SECONDS <= seconds_to_mg <= MARTINGALE_PREALERT_MAX_SECONDS
+            #     and not signal.get("martingale_prealert_sent")
+            # ):
+            #     mg_confidence = calculate_real_confidence(df, direction, boost, trade_stats)
+            #     signal["martingale_confidence_pre"] = mg_confidence
+            #     
+            #     if _is_strong_martingale(df, direction, mg_confidence, mg_key, now):
+            #         messages.append(_build_mg_pre_message(signal, mg_confidence, df))
+            #         print(f"FINAL CONFIDENCE USED: {mg_confidence}%")
+            #         signal["martingale_prealert_sent"] = True
+            #     else:
+            #         print(f"Martingale prealert blocked for {mg_time:%H:%M} {direction}")
+            
+            # Always calculate martingale confidence for the confirmation check
+            mg_confidence = calculate_real_confidence(df, direction, boost, trade_stats)
+            signal["martingale_confidence_pre"] = mg_confidence
 
             if abs((now - mg_time).total_seconds()) <= SIGNAL_WINDOW_SECONDS:
-                # Prefer 1-minute data for martingale confirmation; fallback to main df
-                mg_df = minute_df if (minute_df is not None and len(minute_df) >= 200) else df
-                if mg_key not in processed_signals and _is_strong_martingale(mg_df, direction):
-                    mg_confidence = calculate_confidence(mg_df, direction)
-                    signal["martingale_confidence"] = mg_confidence
-                    print(f"FINAL CONFIDENCE USED: {mg_confidence}%")
-                    _, tp, sl = build_forex_targets(mg_df, direction, mg_confidence)
-                    expiry = mg_time + timedelta(minutes=5)
-                    messages.append(
-                        _build_mg_confirm_message(
-                            signal,
-                            mg_confidence,
-                            expiry,
-                            tp,
-                            sl,
-                            mg_df,
+                if mg_key not in processed_signals:
+                    # Get or calculate confidence for safety check
+                    pre_mg_conf = signal.get("martingale_confidence_pre")
+                    if pre_mg_conf is not None:
+                        mg_confidence = pre_mg_conf
+                    else:
+                        mg_confidence = calculate_real_confidence(df, direction, boost, trade_stats)
+                    
+                    # Check comprehensive safety rules with confidence
+                    should_mg = _is_strong_martingale(df, direction, mg_confidence, mg_key, now)
+                    
+                    mg_live_ok = True
+                    mg_live_reason = ""
+                    if should_mg and minute_df is not None:
+                        mg_live_ok, mg_live_reason = validate_live_signal(minute_df, direction, mg_confidence)
+
+                    if should_mg and mg_live_ok:
+                        signal["martingale_confidence"] = mg_confidence
+                        _, tp, sl = build_forex_targets(df, direction, mg_confidence)
+                        expiry = mg_time + timedelta(minutes=5)
+                        messages.append(
+                            _build_mg_confirm_message(
+                                signal,
+                                mg_confidence,
+                                expiry,
+                                tp,
+                                sl,
+                                df,
+                             )
                         )
-                    )
-                    # Store martingale confirmed signal
-                    try:
-                        entry_price = float(mg_df.iloc[-1]["Close"])
-                        store_tracked_signal(
-                            signal_time=mg_time,
-                            direction=direction,
-                            entry_price=entry_price,
-                            expiry_time=expiry,
-                            signal_type="martingale",
+                        # Smart signal for martingale
+                        create_signal(
                             pair=signal.get("pair", "EURUSD"),
-                            confidence=mg_confidence,
-                            df=mg_df,
+                            direction=direction,
+                            signal_time=mg_time,
+                            expiry_time=expiry,
+                            entry_price=float(df.iloc[-1]["Close"]),
+                            stop_loss=sl,
+                            take_profit=tp,
+                            confidence=int(mg_confidence),
+                            auto_trade=True,
+                            is_martingale=True
                         )
-                    except Exception as e:
-                        print(f"store_tracked_signal error: {e}")
+                        
+                        signal["martingale_confirmed_sent"] = True
+                        if _log_throttle(f"mg_confirm_{mg_time:%H:%M}", 180):
+                            logger.info(f"Martingale confirmed: {mg_time:%H:%M} {direction}")
+                    elif signal.get("martingale_prealert_sent") and not signal.get("martingale_skip_sent"):
+                        reason = "Weakened martingale structure" if not should_mg else mg_live_reason
+                        if _log_throttle(f"mg_skip_{mg_time:%H:%M}", 300):
+                            logger.info(f"MG skipped: {mg_time:%H:%M} - {reason[:40]}")
+                        
+                        # Send skip message using new formatter
+                        skip_msg = TelegramFormatter.format_skipped_signal(
+                            pair=signal.get("pair", "EURUSD"),
+                            direction=direction,
+                            time=f"{mg_time:%H:%M}",
+                            reason=reason,
+                        )
+                        messages.append(skip_msg)
+                        signal["martingale_skip_sent"] = True
+
                     processed_signals.add(mg_key)
-                    signal["martingale_confirmed_sent"] = True
-                    print(f"Signal confirmed: {mg_time:%H:%M} {direction}")
         except Exception as e:
-            print(f"Processing error: {e}")
+            if _log_throttle("proc_error", 60):
+                logger.error(f"Processing error: {e}")
             continue
 
     return messages

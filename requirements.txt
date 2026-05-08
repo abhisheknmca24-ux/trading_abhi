@@ -2,3 +2,6 @@ python-dotenv
 pandas
 requests
 ta
+numpy
+pytz
+python-dateutil

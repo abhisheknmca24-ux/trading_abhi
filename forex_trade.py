@@ -1,3 +1,10 @@
+"""
+Forex Signal Builder
+Generates entry, TP, SL and safe leverage recommendations.
+Leverage is CAPPED at 30x maximum for risk safety.
+"""
+
+
 def get_forex_signal(df, signal, confidence):
     last = df.iloc[-1]
     atr = last["ATR"]
@@ -7,19 +14,19 @@ def get_forex_signal(df, signal, confidence):
         tp_factor = 2.0
         sl_factor = 0.8
         hold = "30-60 min"
-        multiplier = "150x"
+        multiplier = "30x"   # was 150x — capped at 30x
         auto_close = "7%"
     elif confidence >= 75:
         tp_factor = 1.5
         sl_factor = 1.0
         hold = "15-30 min"
-        multiplier = "100x"
+        multiplier = "20x"   # was 100x — capped at 20x
         auto_close = "5%"
     else:
         tp_factor = 1.0
         sl_factor = 1.2
         hold = "10-15 min"
-        multiplier = "50x"
+        multiplier = "10x"   # was 50x — capped at 10x
         auto_close = "3%"
 
     if signal == "CALL":
