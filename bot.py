@@ -354,7 +354,8 @@ def run():
                 continue
 
             fixed = get_fixed_signal(df)
-            
+            current_candle_time = df.iloc[-1].get("CandleTime", df.index[-1])
+
             if fixed:
                 # NEW: Market Safety Check for Auto-Bot
                 safety_ok, safety_msg, penalty = run_market_safety(df, fixed['signal'])
@@ -387,8 +388,6 @@ def run():
                     run_external_signal_engine(df, cached_minute_df)
                     time.sleep(sleep_time)
                     continue
-
-                current_candle_time = df.iloc[-1].get("CandleTime", df.index[-1])
 
                 if current_candle_time == last_signal_time:
                     logger.debug("Duplicate signal skipped")

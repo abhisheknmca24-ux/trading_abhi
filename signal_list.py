@@ -11,6 +11,8 @@ from typing import Callable, List, Optional
 import pandas as pd
 
 from indicators import add_indicators
+from market_safety import run_market_safety
+from confirmation_engine import validate_live_signal
 
 try:
     from zoneinfo import ZoneInfo
@@ -788,7 +790,7 @@ def _is_strong_martingale(df: pd.DataFrame, direction: str) -> bool:
     return confidence >= 75
 
 
-def _should_take_signal(df: pd.DataFrame, direction: str, confidence: int, is_next_signal: bool) -> tuple[bool, str]:
+def _should_take_signal(df: pd.DataFrame, direction: str, confidence: int, is_next_signal: bool) -> tuple[bool, str, int]:
     safety_ok, safety_reason = _check_safety_rules(df, direction, confidence)
     if not safety_ok:
         return False, safety_reason, confidence
