@@ -289,7 +289,7 @@ def run_external_signal_engine(df, cached_minute_df=None):
             if not is_api_call_allowed():
                 return None
             minute_df = get_data("1min")
-            if minute_df is None or len(minute_df) < 200:
+            if minute_df is None:
                 return minute_df
             return add_indicators(minute_df)
 
@@ -372,7 +372,7 @@ def run():
             if cached_minute_df is None or cached_minute_time != now_minute_key:
                 if is_api_call_allowed():
                     cached_minute_df = get_data("1min")
-                    if cached_minute_df is not None and len(cached_minute_df) >= 200:
+                    if cached_minute_df is not None:
                         cached_minute_df = add_indicators(cached_minute_df)
                     cached_minute_time = now_minute_key
                 else:
