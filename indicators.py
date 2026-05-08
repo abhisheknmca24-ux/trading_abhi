@@ -3,14 +3,14 @@ from ta.momentum import RSIIndicator
 from ta.trend import EMAIndicator
 from ta.volatility import AverageTrueRange
 
-REQUIRED_INDICATORS = ("EMA50", "EMA200", "RSI", "ATR", "TrendStrength")
+EXPECTED_INDICATORS = ("EMA50", "EMA200", "RSI", "ATR", "TrendStrength")
 
 
 def add_indicators(df):
     if df is None or len(df) == 0:
         return df
 
-    if all(column in df.columns for column in REQUIRED_INDICATORS):
+    if all(column in df.columns for column in EXPECTED_INDICATORS):
         return df
 
     df = df.copy()
