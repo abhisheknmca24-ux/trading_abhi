@@ -1,46 +1,75 @@
-from __future__ import annotations
-
-from dataclasses import dataclass, field
-from collections import deque
-from typing import Optional
-
+from logger import logger
 import pandas as pd
 
+class CacheManager:
+    def __init__(self):
+        self.cached_df = None
+        self.cached_interval = None
+        self.cached_candle_key = None
+        
+        self.cached_minute_df = None
+        self.cached_minute_time = None
+        
+        self.processed_1min_df = None
+        self.processed_5min_df = None
 
-@dataclass
-class CandleCacheManager:
-    cached_5m_dataframe: Optional[pd.DataFrame] = None
-    cached_1m_dataframe: Optional[pd.DataFrame] = None
-    processed_dataframe: Optional[pd.DataFrame] = None
-    candle_keys: set[str] = field(default_factory=set)
-    _ordered_candle_keys: deque[str] = field(default_factory=deque)
-    max_candle_keys: int = 500
+    def get_candle_key(self, interval):
+        now = pd.Timestamp.now(tz="Asia/Kolkata")
+        if interval == "1min":
+            return now.floor("min")
+        if interval == "5min":
+            return now.floor("5min")
+        return now.floor("min")
 
-    def should_refresh(self, candle_key: str) -> bool:
-        if candle_key in self.candle_keys:
-            return False
-        self.candle_keys.add(candle_key)
-        self._ordered_candle_keys.append(candle_key)
-        if len(self._ordered_candle_keys) > self.max_candle_keys:
-            oldest_key = self._ordered_candle_keys.popleft()
-            self.candle_keys.discard(oldest_key)
-        return True
+    def get_dataframe(self, interval, fetch_func):
+        current_candle_key = self.get_candle_key(interval)
+        
+        if interval == "1min":
+            if self.cached_minute_df is not None and self.cached_minute_time == current_candle_key:
+                return self.cached_minute_df
+            else:
+                df = fetch_func(interval)
+                if df is not None:
+                    self.cached_minute_df = df
+                    self.cached_minute_time = current_candle_key
+                    # Reset only 1min processed cache
+                    self.processed_1min_df = None
+                return df
+                
+        else:
+            if (
+                self.cached_df is not None
+                and self.cached_interval == interval
+                and self.cached_candle_key == current_candle_key
+            ):
+                logger.debug(f"Using cached {interval} data")
+                return self.cached_df
+            else:
+                df = fetch_func(interval)
+                if df is not None:
+                    self.cached_interval = interval
+                    self.cached_candle_key = current_candle_key
+                    self.cached_df = df
+                    # Reset only 5min processed cache
+                    self.processed_5min_df = None
+                return df
 
-    def store_5m_dataframe(self, dataframe: Optional[pd.DataFrame]) -> None:
-        self.cached_5m_dataframe = dataframe
+    def get_processed_dataframe(self, interval, fetch_func, process_func):
+        df = self.get_dataframe(interval, fetch_func)
+        if df is None:
+            return None
+            
+        if interval == "1min":
+            if self.processed_1min_df is not None:
+                return self.processed_1min_df
+            # Indicators are safe to add in-place; removing .copy() to save RAM
+            self.processed_1min_df = process_func(df)
+            return self.processed_1min_df
+        else:
+            if self.processed_5min_df is not None:
+                return self.processed_5min_df
+            # Indicators are safe to add in-place; removing .copy() to save RAM
+            self.processed_5min_df = process_func(df)
+            return self.processed_5min_df
 
-    def store_1m_dataframe(self, dataframe: Optional[pd.DataFrame]) -> None:
-        self.cached_1m_dataframe = dataframe
-
-    def store_processed_dataframe(self, dataframe: Optional[pd.DataFrame]) -> None:
-        self.processed_dataframe = dataframe
-
-    def reset(self) -> None:
-        self.cached_5m_dataframe = None
-        self.cached_1m_dataframe = None
-        self.processed_dataframe = None
-        self.candle_keys.clear()
-        self._ordered_candle_keys.clear()
-
-
-cache_manager = CandleCacheManager()
+cache = CacheManager()

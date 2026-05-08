@@ -1,1 +1,62 @@
-[]
+[
+  {
+    "time": "17:05",
+    "pair": "EURUSD",
+    "direction": "CALL",
+    "confidence": 75
+  },
+  {
+    "time": "19:40",
+    "pair": "EURUSD",
+    "direction": "CALL",
+    "confidence": 74
+  },
+  {
+    "time": "00:10",
+    "pair": "EURUSD",
+    "direction": "CALL",
+    "confidence": 73
+  },
+  {
+    "time": "20:20",
+    "pair": "EURUSD",
+    "direction": "CALL",
+    "confidence": 72
+  },
+  {
+    "time": "18:40",
+    "pair": "EURUSD",
+    "direction": "CALL",
+    "confidence": 71
+  },
+  {
+    "time": "08:30",
+    "pair": "EURUSD",
+    "direction": "CALL",
+    "confidence": 70
+  },
+  {
+    "time": "18:25",
+    "pair": "EURUSD",
+    "direction": "CALL",
+    "confidence": 70
+  },
+  {
+    "time": "23:35",
+    "pair": "EURUSD",
+    "direction": "CALL",
+    "confidence": 70
+  },
+  {
+    "time": "00:00",
+    "pair": "EURUSD",
+    "direction": "PUT",
+    "confidence": 70
+  },
+  {
+    "time": "00:55",
+    "pair": "EURUSD",
+    "direction": "CALL",
+    "confidence": 70
+  }
+]

@@ -1,32 +1,14 @@
 import pandas as pd
-from ta.momentum import RSIIndicator
 from ta.trend import EMAIndicator
+from ta.momentum import RSIIndicator
 from ta.volatility import AverageTrueRange
 
-EXPECTED_INDICATORS = ("EMA50", "EMA200", "RSI", "ATR", "TrendStrength")
-
-
 def add_indicators(df):
-    if df is None or len(df) == 0:
-        return df
-
-    if all(column in df.columns for column in EXPECTED_INDICATORS):
-        return df
-
-    df = df.copy()
-
-    if "EMA50" not in df.columns:
-        df["EMA50"] = EMAIndicator(df["Close"], 50).ema_indicator()
-    if "EMA200" not in df.columns:
-        df["EMA200"] = EMAIndicator(df["Close"], 200).ema_indicator()
-    if "RSI" not in df.columns:
-        df["RSI"] = RSIIndicator(df["Close"], 14).rsi()
-    if "ATR" not in df.columns:
-        df["ATR"] = AverageTrueRange(df["High"], df["Low"], df["Close"], 14).average_true_range()
-
-    if "TrendStrength" not in df.columns:
-        df["TrendStrength"] = (df["EMA50"] - df["EMA200"]).abs()
-
+    df["EMA50"] = EMAIndicator(df["Close"], 50).ema_indicator()
+    df["EMA200"] = EMAIndicator(df["Close"], 200).ema_indicator()
+    df["RSI"] = RSIIndicator(df["Close"], 14).rsi()
+    df["ATR"] = AverageTrueRange(df["High"], df["Low"], df["Close"], 14).average_true_range()
+    df["TrendStrength"] = (df["EMA50"] - df["EMA200"]).abs()
     return df
 
 
