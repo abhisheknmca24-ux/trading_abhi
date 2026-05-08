@@ -10,6 +10,7 @@ from typing import Callable, List, Optional
 import pandas as pd
 
 from indicators import add_indicators
+from market_safety import run_market_safety
 
 try:
     from zoneinfo import ZoneInfo
@@ -25,6 +26,7 @@ PRE_SIGNAL_MAX_SECONDS = 120
 MARTINGALE_PREALERT_MIN_SECONDS = 45
 MARTINGALE_PREALERT_MAX_SECONDS = 150
 MARTINGALE_ENTRY_DELAY = timedelta(minutes=2)
+GENERATED_SIGNALS_FILE = "generated_signals.json"
 SIGNAL_PATTERN = re.compile(r"^(?P<hour>\d{2}):(?P<minute>\d{2})\s+EURUSD\s+(?P<signal>CALL|PUT)$")
 
 
@@ -142,6 +144,84 @@ def load_signal_entries(signal_lines: List[str], current_day: Optional[date] = N
     return entries
 
 
+def load_generated_signals() -> List[SignalEntry]:
+    """Load generated_signals.json and convert to SignalEntry list."""
+    try:
+        if not os.path.exists(GENERATED_SIGNALS_FILE):
+            return []
+        with open(GENERATED_SIGNALS_FILE) as f:
+            content = f.read().strip()
+            if not content:
+                return []
+            generated = json.loads(content)
+        if not isinstance(generated, list):
+            return []
+    except Exception as e:
+        print(f"Error loading generated signals: {e}")
+        return []
+
+    tz = _get_timezone()
+    today = _now().date()
+    entries = []
+    for sig in generated:
+        try:
+            time_str = str(sig.get("time", ""))
+            pair = str(sig.get("pair", "EURUSD")).upper()
+            direction = str(sig.get("direction", "")).upper()
+
+            if not time_str or direction not in ("CALL", "PUT"):
+                continue
+
+            parts = time_str.split(":")
+            hour, minute = int(parts[0]), int(parts[1])
+            sig_time = datetime.combine(today, time(hour, minute))
+            if tz is not None:
+                sig_time = sig_time.replace(tzinfo=tz)
+
+            if sig_time.time() < MARKET_OPEN:
+                continue
+
+            raw_line = f"{time_str} {pair} {direction}"
+            entries.append(SignalEntry(
+                signal_time=sig_time,
+                pair=pair,
+                direction=direction,
+                raw_line=raw_line,
+            ))
+        except (KeyError, ValueError, IndexError, TypeError) as e:
+            print(f"Error parsing generated signal {sig}: {e}")
+            continue
+
+    return entries
+
+
+def _merge_generated_into_signal_list() -> None:
+    """Merge generated signal entries into signal_list, avoiding duplicates."""
+    global signal_list
+
+    generated_entries = load_generated_signals()
+    if not generated_entries:
+        return
+
+    existing_keys = set()
+    for sig in signal_list:
+        try:
+            key = _signal_key(sig["time"], sig["direction"])
+            existing_keys.add(key)
+        except Exception:
+            continue
+
+    new_entries = []
+    for entry in generated_entries:
+        key = _signal_key(entry.signal_time, entry.direction)
+        if key not in existing_keys:
+            existing_keys.add(key)
+            new_entries.append(entry)
+
+    if new_entries:
+        signal_list.extend(_build_signal_state(new_entries))
+
+
 def update_signal_list(signal_lines: Optional[List[str]] = None, now: Optional[datetime] = None) -> List[dict]:
     global signal_list, processed_signals, last_update_id, last_signal_update_time, evaluated_signal_count, confirmed_signal_count
 
@@ -159,6 +239,7 @@ def update_signal_list(signal_lines: Optional[List[str]] = None, now: Optional[d
         confirmed_signal_count = 0
 
     if signal_lines is None:
+        _merge_generated_into_signal_list()
         last_signal_update_time = now
         return signal_list
 
@@ -175,6 +256,7 @@ def update_signal_list(signal_lines: Optional[List[str]] = None, now: Optional[d
         evaluated_signal_count = 0
         confirmed_signal_count = 0
         last_signal_update_time = now
+        _merge_generated_into_signal_list()
         return signal_list
 
     update_id = f"mem-{current_day.isoformat()}-{len(signal_lines)}-{'|'.join(signal_lines)}"
@@ -188,6 +270,7 @@ def update_signal_list(signal_lines: Optional[List[str]] = None, now: Optional[d
         last_update_id = update_id
         print("Signal list updated")
 
+    _merge_generated_into_signal_list()
     last_signal_update_time = now
     return signal_list
 
@@ -566,6 +649,10 @@ def _is_strong_martingale(df: pd.DataFrame, direction: str) -> bool:
 
 
 def _should_take_signal(df: pd.DataFrame, direction: str, confidence: int, is_next_signal: bool) -> tuple[bool, str]:
+    market_ok, market_reason = run_market_safety(df)
+    if not market_ok:
+        return False, market_reason
+
     safety_ok, safety_reason = _check_safety_rules(df, direction, confidence)
     if not safety_ok:
         return False, safety_reason
