@@ -3,19 +3,76 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 import json
+import logging
 import os
 import re
+import time as _time_module
 from typing import Callable, List, Optional
 
 import pandas as pd
 
 from indicators import add_indicators
 
+# New architecture modules — imported with graceful fallback so the bot keeps
+# running even if a module is missing during a partial deploy.
+try:
+    from market_cache import get_cached_1m_df, set_cached_1m_df
+    _CACHE_AVAILABLE = True
+except ImportError:
+    _CACHE_AVAILABLE = False
+
+try:
+    from market_safety import check_market_safety
+    _MARKET_SAFETY_AVAILABLE = True
+except ImportError:
+    _MARKET_SAFETY_AVAILABLE = False
+
+try:
+    from confirmation_engine import validate_live_signal as _live_validate
+    _CONFIRM_ENGINE_AVAILABLE = True
+except ImportError:
+    _CONFIRM_ENGINE_AVAILABLE = False
+
+try:
+    from martingale_safety import is_mg_safe, mg_confidence_adjustment, MG_MIN_CONFIDENCE
+    _MG_SAFETY_AVAILABLE = True
+except ImportError:
+    _MG_SAFETY_AVAILABLE = False
+    MG_MIN_CONFIDENCE = 70
+
+try:
+    from learning_engine import get_confidence_adjustment, record_outcome, maybe_periodic_save
+    _LEARNING_AVAILABLE = True
+except ImportError:
+    _LEARNING_AVAILABLE = False
+
+try:
+    from risk_management import (
+        is_trade_allowed,
+        record_trade_open,
+        record_trade_close,
+        get_dynamic_threshold,
+        maybe_save_state as _rm_maybe_save,
+    )
+    _RISK_MGMT_AVAILABLE = True
+except ImportError:
+    _RISK_MGMT_AVAILABLE = False
+
 try:
     from zoneinfo import ZoneInfo
 except ImportError:  # pragma: no cover
     ZoneInfo = None
 
+# ---------------------------------------------------------------------------
+# Logging setup — replaces all raw print() calls.
+# Set LOG_LEVEL env var to DEBUG for verbose output; default is INFO.
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.getLevelName(os.getenv("LOG_LEVEL", "INFO")),
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger(__name__)
 
 TIMEZONE_NAME = "Asia/Kolkata"
 MARKET_OPEN = time(13, 30)
@@ -26,6 +83,10 @@ MARTINGALE_PREALERT_MIN_SECONDS = 45
 MARTINGALE_PREALERT_MAX_SECONDS = 150
 MARTINGALE_ENTRY_DELAY = timedelta(minutes=2)
 SIGNAL_PATTERN = re.compile(r"^(?P<hour>\d{2}):(?P<minute>\d{2})\s+EURUSD\s+(?P<signal>CALL|PUT)$")
+
+# Debounce interval for tracked-signals JSON persistence (seconds)
+_TRACKED_SIGNALS_SAVE_INTERVAL = 60
+_last_tracked_save: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -122,7 +183,7 @@ def _parse_line(line: str, current_day: date) -> Optional[SignalEntry]:
             raw_line=stripped,
         )
     except Exception as e:
-        print(f"Parse error: {e}")
+        logger.debug("Parse error: %s", e)
         return None
 
 
@@ -186,7 +247,7 @@ def update_signal_list(signal_lines: Optional[List[str]] = None, now: Optional[d
         evaluated_signal_count = 0
         confirmed_signal_count = 0
         last_update_id = update_id
-        print("Signal list updated")
+        logger.info("Signal list updated (%d entries)", len(signal_list))
 
     last_signal_update_time = now
     return signal_list
@@ -228,88 +289,92 @@ def should_force_fast_mode(now: Optional[datetime] = None, window_seconds: int =
 
 
 def validate_sniper_signal(df: pd.DataFrame, direction: str) -> bool:
-    if df is None or len(df) < 200:
+    """Lightweight sniper-signal scoring.
+
+    Instead of hard-rejecting on every sub-criterion, compute a quick score
+    and return True when the setup is acceptable.  Only truly dangerous
+    conditions (missing data, opposite EMA trend) cause immediate rejection.
+    """
+    if df is None or len(df) < 20:
         return False
 
-    df = add_indicators(df)
+    # Use already-processed df when indicators are present; add if missing.
+    if "EMA50" not in df.columns:
+        df = add_indicators(df)
+
     last = df.iloc[-1]
-    prev = df.iloc[-2]
-
-    required_values = [
-        last["EMA50"],
-        last["EMA200"],
-        last["RSI"],
-        prev["RSI"],
-        last["ATR"],
-        df["ATR"].mean(),
-    ]
-    if any(pd.isna(value) for value in required_values):
+    required = [last.get("EMA50"), last.get("EMA200"), last.get("RSI"), last.get("ATR")]
+    if any(pd.isna(v) for v in required):
         return False
 
-    atr = float(last["ATR"])
-    atr_mean = float(df["ATR"].mean())
-    candle_size = abs(float(last["Close"]) - float(last["Open"]))
-    avg_candle = (df["Close"] - df["Open"]).abs().tail(10).mean()
-    distance = abs(float(last["Close"]) - float(last["EMA50"]))
-
-    trend_threshold = max(0.0002, atr * 0.15)
-    ema_distance_threshold = max(0.0003, atr * 0.50)
-
-    if direction == "CALL":
-        trend_ok = last["EMA50"] > last["EMA200"]
-        rsi_ok = last["RSI"] > prev["RSI"]
-    else:
-        trend_ok = last["EMA50"] < last["EMA200"]
-        rsi_ok = last["RSI"] < prev["RSI"]
-
-    if not trend_ok:
+    # Hard block: EMA trend directly opposes signal direction
+    if direction == "CALL" and float(last["EMA50"]) < float(last["EMA200"]):
         return False
-    if abs(float(last["EMA50"]) - float(last["EMA200"])) <= trend_threshold:
-        return False
-    if not rsi_ok:
-        return False
-    if atr <= atr_mean:
-        return False
-    if candle_size <= float(avg_candle):
-        return False
-    if distance > ema_distance_threshold:
+    if direction == "PUT" and float(last["EMA50"]) > float(last["EMA200"]):
         return False
 
-    return True
+    # Soft scoring — accumulate points, require at least 1 positive signal
+    score = 0
+    try:
+        atr = float(last["ATR"])
+        atr_mean = float(df["ATR"].tail(20).mean())
+        if not pd.isna(atr_mean) and atr_mean > 0 and atr > atr_mean:
+            score += 1
+
+        rsi = float(last["RSI"])
+        if direction == "CALL" and rsi > 50:
+            score += 1
+        elif direction == "PUT" and rsi < 50:
+            score += 1
+
+        candle_size = abs(float(last["Close"]) - float(last["Open"]))
+        avg_candle = float((df["Close"] - df["Open"]).abs().tail(10).mean())
+        if not pd.isna(avg_candle) and avg_candle > 0 and candle_size >= avg_candle * 0.7:
+            score += 1
+    except Exception as exc:
+        logger.debug("validate_sniper_signal scoring error: %s", exc)
+
+    return score >= 1
 
 
 def validate_martingale_signal(df: pd.DataFrame, direction: str) -> bool:
-    if not validate_sniper_signal(df, direction):
+    """Martingale validation — uses martingale_safety when available.
+
+    Falls back to a simple momentum check so MG trades are not blocked by the
+    full validation stack.
+    """
+    if df is None or len(df) < 10:
         return False
 
-    df = add_indicators(df)
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
+    # Use new lightweight martingale safety module when available
+    if _MG_SAFETY_AVAILABLE:
+        safe, reason = is_mg_safe(df, direction)
+        if not safe:
+            logger.debug("MG blocked: %s", reason)
+        return safe
 
-    if direction == "CALL":
-        if last["RSI"] <= 60:
-            return False
-        if last["RSI"] <= prev["RSI"]:
-            return False
-        if float(last["Close"]) <= float(last["Open"]):
-            return False
-    else:
-        if last["RSI"] >= 40:
-            return False
-        if last["RSI"] >= prev["RSI"]:
-            return False
-        if float(last["Close"]) >= float(last["Open"]):
-            return False
-
-    return True
+    # Fallback: lightweight momentum-only check
+    if "ATR" not in df.columns:
+        df = add_indicators(df)
+    try:
+        last = df.iloc[-1]
+        atr = float(last["ATR"])
+        momentum = abs(float(last["Close"]) - float(df.iloc[-2]["Close"]))
+        return not pd.isna(atr) and atr > 0 and momentum > atr * 0.05
+    except Exception:
+        return True
 
 
 def calculate_confidence(df: pd.DataFrame, direction: str) -> int:
-    df = add_indicators(df)
+    """Confidence scoring — uses already-processed df when indicators present."""
+    # Avoid recalculating indicators if already attached
+    if "EMA50" not in df.columns:
+        df = add_indicators(df)
+
     last = df.iloc[-1]
     prev = df.iloc[-2]
     atr = float(last["ATR"]) if not pd.isna(last.get("ATR")) else 0.0
-    atr_mean = float(df["ATR"].mean()) if not pd.isna(df["ATR"].mean()) else 0.0
+    atr_mean = float(df["ATR"].tail(20).mean()) if not pd.isna(df["ATR"].tail(20).mean()) else 0.0
     candle_size = abs(float(last["Close"]) - float(last["Open"]))
     avg_candle = float((df["Close"] - df["Open"]).abs().tail(10).mean())
     distance = abs(float(last["Close"]) - float(last["EMA50"]))
@@ -324,24 +389,30 @@ def calculate_confidence(df: pd.DataFrame, direction: str) -> int:
             score += 25
 
     # RSI Movement: +15
+    rsi = float(last["RSI"]) if not pd.isna(last.get("RSI")) else 50.0
+    rsi_prev = float(prev["RSI"]) if not pd.isna(prev.get("RSI")) else 50.0
     if direction == "CALL":
-        rsi = float(last["RSI"])
-        rsi_prev = float(prev["RSI"])
-        if rsi > 55 and rsi > rsi_prev:
+        if rsi > 52 and rsi > rsi_prev:
             score += 15
+        elif rsi > 48:
+            score += 8   # partial credit — softer requirement
     else:
-        rsi = float(last["RSI"])
-        rsi_prev = float(prev["RSI"])
-        if rsi < 45 and rsi < rsi_prev:
+        if rsi < 48 and rsi < rsi_prev:
             score += 15
+        elif rsi < 52:
+            score += 8
 
     # ATR Strength: +15
-    if atr > atr_mean:
+    if atr_mean > 0 and atr > atr_mean:
         score += 15
+    elif atr_mean > 0 and atr > atr_mean * 0.8:
+        score += 8   # partial credit for near-average ATR
 
     # Candle Strength: +10
-    if candle_size > avg_candle:
+    if avg_candle > 0 and candle_size > avg_candle:
         score += 10
+    elif avg_candle > 0 and candle_size > avg_candle * 0.7:
+        score += 5
 
     # Distance: +10 (if close to EMA50)
     if distance <= max(0.0003, atr * 0.50):
@@ -349,11 +420,22 @@ def calculate_confidence(df: pd.DataFrame, direction: str) -> int:
 
     # Score now maxes at 75 based on weights above; scale to percentage and cap at 90%
     confidence = int((score / 75) * 85)
+
+    # Apply learning engine adjustment (soft, bounded)
+    if _LEARNING_AVAILABLE:
+        try:
+            adj = get_confidence_adjustment(f"signal_{direction.lower()}")
+            confidence = max(0, min(95, confidence + adj))
+        except Exception:
+            pass
+
     return min(confidence, 90)
 
 
 def build_forex_targets(df: pd.DataFrame, direction: str, confidence: int) -> tuple[float, float, float]:
-    df = add_indicators(df)
+    # Use pre-processed indicators when available
+    if "ATR" not in df.columns:
+        df = add_indicators(df)
     last = df.iloc[-1]
     atr = float(last["ATR"])
     entry = float(last["Close"])
@@ -500,59 +582,64 @@ def _build_confirm_message(signal: dict, confidence: int, expiry: datetime, tp: 
 
 
 def _check_safety_rules(df: pd.DataFrame, direction: str, confidence: int) -> tuple[bool, str]:
-    if confidence < 70:
-        return False, "confidence below 70"
+    """Confidence-based safety check — prefers scoring over hard rejection.
 
-    if df is None or len(df) < 200:
+    Hard blocks ONLY on:
+    - Confidence below minimum threshold
+    - Missing data
+    - EMA trend directly opposing direction (dangerous counter-trend trade)
+    - RSI in extreme opposite zone (e.g. RSI 82 on a CALL = very overbought)
+    - Market safety issues (extreme volatility, wick danger, session)
+
+    Soft conditions (weak RSI, low ATR, small candles) are captured in
+    calculate_confidence() instead of here.
+    """
+    if confidence < 68:
+        return False, f"confidence too low ({confidence}%)"
+
+    if df is None or len(df) < 20:
         return False, "insufficient data"
 
-    df = add_indicators(df)
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
+    # Use pre-processed indicators when available
+    if "EMA50" not in df.columns:
+        df = add_indicators(df)
 
-    required_values = [
-        last["EMA50"],
-        last["EMA200"],
-        last["RSI"],
-        prev["RSI"],
-        last["ATR"],
-        df["ATR"].mean(),
-    ]
-    if any(pd.isna(value) for value in required_values):
+    last = df.iloc[-1]
+    required = [last.get("EMA50"), last.get("EMA200"), last.get("RSI"), last.get("ATR")]
+    if any(pd.isna(v) for v in required):
         return False, "indicator values unavailable"
 
-    atr = float(last["ATR"])
-    atr_mean = float(df["ATR"].mean())
-    trend_gap = abs(float(last["EMA50"]) - float(last["EMA200"]))
-    trend_threshold = max(0.0002, atr * 0.15)
     rsi_value = float(last["RSI"])
 
-    # Overbought/Oversold protection
-    if direction == "CALL" and rsi_value >= 68:
-        return False, "RSI overbought, reject CALL"
-    if direction == "PUT" and rsi_value <= 32:
-        return False, "RSI oversold, reject PUT"
+    # Hard block: RSI in *extreme* opposite zone only
+    if direction == "CALL" and rsi_value >= 78:
+        return False, f"RSI extremely overbought ({rsi_value:.0f})"
+    if direction == "PUT" and rsi_value <= 22:
+        return False, f"RSI extremely oversold ({rsi_value:.0f})"
 
-    if direction == "CALL":
-        trend_direction_ok = float(last["EMA50"]) > float(last["EMA200"])
-        rsi_opposite_extreme = rsi_value < 35
-    else:
-        trend_direction_ok = float(last["EMA50"]) < float(last["EMA200"])
-        rsi_opposite_extreme = rsi_value > 65
+    # Hard block: EMA directly opposes direction
+    if direction == "CALL" and float(last["EMA50"]) < float(last["EMA200"]):
+        return False, "EMA bearish, rejecting CALL"
+    if direction == "PUT" and float(last["EMA50"]) > float(last["EMA200"]):
+        return False, "EMA bullish, rejecting PUT"
 
-    if not trend_direction_ok or trend_gap <= trend_threshold:
-        return False, "trend unclear"
+    # Market safety check (session, extreme volatility, wick danger)
+    if _MARKET_SAFETY_AVAILABLE:
+        try:
+            mkt_ok, mkt_reason = check_market_safety(df)
+            if not mkt_ok:
+                return False, f"market unsafe: {mkt_reason}"
+        except Exception as exc:
+            logger.debug("market safety check error: %s", exc)
 
-    if rsi_opposite_extreme:
-        return False, "RSI extreme opposite"
-
-    if direction == "CALL" and rsi_value < 55:
-        return False, "RSI weak zone"
-    if direction == "PUT" and rsi_value > 45:
-        return False, "RSI weak zone"
-
-    if atr <= atr_mean:
-        return False, "low volatility"
+    # Live validation (sudden reversal, spike, momentum collapse)
+    if _CONFIRM_ENGINE_AVAILABLE:
+        try:
+            live_ok, live_reason = _live_validate(df, direction)
+            if not live_ok:
+                return False, f"live validation: {live_reason}"
+        except Exception as exc:
+            logger.debug("live validation error: %s", exc)
 
     return True, "safety passed"
 
@@ -562,7 +649,16 @@ def _is_strong_martingale(df: pd.DataFrame, direction: str) -> bool:
         return False
 
     confidence = calculate_confidence(df, direction)
-    return confidence >= 75
+
+    # Apply MG-specific confidence adjustment
+    if _MG_SAFETY_AVAILABLE:
+        try:
+            adj = mg_confidence_adjustment(df, direction)
+            confidence = max(0, min(95, confidence + adj))
+        except Exception:
+            pass
+
+    return confidence >= MG_MIN_CONFIDENCE
 
 
 def _should_take_signal(df: pd.DataFrame, direction: str, confidence: int, is_next_signal: bool) -> tuple[bool, str]:
@@ -570,8 +666,7 @@ def _should_take_signal(df: pd.DataFrame, direction: str, confidence: int, is_ne
     if not safety_ok:
         return False, safety_reason
 
-    # First signal is strict: only high-confidence entries.
-    base_threshold = 70 if is_next_signal else 75
+    base_threshold = 68 if is_next_signal else 72
     threshold = get_adaptive_trade_threshold(base_threshold)
 
     if confidence >= threshold:
@@ -650,35 +745,54 @@ def get_trade_performance() -> dict:
 
 
 def get_adaptive_trade_threshold(base_threshold: int = 70) -> int:
+    """Return a dynamic confidence threshold.
+
+    Uses risk_management module when available (supports mode-based adjustment
+    with a hard cap on total increase).  Falls back to simple win-rate logic.
+    """
+    if _RISK_MGMT_AVAILABLE:
+        try:
+            return get_dynamic_threshold(base_threshold)
+        except Exception:
+            pass
+
+    # Fallback: simple win-rate-based adjustment
     recent_10 = _get_recent_resolved_trades(10)
     if not recent_10:
         return base_threshold
 
     recent_win_rate = _win_rate(recent_10)
     if recent_win_rate < 50:
-        return base_threshold + 5
+        return min(base_threshold + 5, base_threshold + 10)
     if recent_win_rate > 70:
-        return 70
+        return max(68, base_threshold - 2)
     return base_threshold
 
 
 def _save_tracked_signals_to_json() -> None:
-    """Save tracked_signals to JSON file for persistence across restarts."""
+    """Debounced save of tracked_signals to JSON."""
+    global _last_tracked_save
+    now_ts = _time_module.monotonic()
+    if now_ts - _last_tracked_save < _TRACKED_SIGNALS_SAVE_INTERVAL:
+        return  # skip — too soon
+
     try:
         json_data = []
         for signal in tracked_signals:
             data = dict(signal)
-            # Convert datetime objects to ISO format strings
             if "signal_time" in data and isinstance(data["signal_time"], datetime):
                 data["signal_time"] = data["signal_time"].isoformat()
             if "expiry_time" in data and isinstance(data["expiry_time"], datetime):
                 data["expiry_time"] = data["expiry_time"].isoformat()
             json_data.append(data)
-        
+
         with open("tracked_signals.json", "w") as f:
             json.dump(json_data, f, indent=2)
+
+        _last_tracked_save = now_ts
+        logger.debug("Tracked signals saved (%d entries)", len(json_data))
     except Exception as e:
-        print(f"Error saving tracked signals to JSON: {e}")
+        logger.warning("Error saving tracked signals: %s", e)
 
 
 def _load_tracked_signals_from_json() -> None:
@@ -689,15 +803,14 @@ def _load_tracked_signals_from_json() -> None:
             with open("tracked_signals.json", "r") as f:
                 json_data = json.load(f)
                 for data in json_data:
-                    # Convert ISO format strings back to datetime objects
                     if "signal_time" in data and isinstance(data["signal_time"], str):
                         data["signal_time"] = datetime.fromisoformat(data["signal_time"])
                     if "expiry_time" in data and isinstance(data["expiry_time"], str):
                         data["expiry_time"] = datetime.fromisoformat(data["expiry_time"])
                     tracked_signals.append(data)
-            print(f"Loaded {len(tracked_signals)} tracked signals from JSON")
+            logger.info("Loaded %d tracked signals from JSON", len(tracked_signals))
     except Exception as e:
-        print(f"Error loading tracked signals from JSON: {e}")
+        logger.warning("Error loading tracked signals: %s", e)
 
 
 def store_tracked_signal(
@@ -720,8 +833,8 @@ def store_tracked_signal(
         "signal_type": signal_type,
         "pair": pair,
         "confidence": float(confidence),
-        "rsi": float(last["RSI"]) if not pd.isna(last["RSI"]) else None,
-        "atr": float(last["ATR"]) if not pd.isna(last["ATR"]) else None,
+        "rsi": float(last["RSI"]) if not pd.isna(last.get("RSI")) else None,
+        "atr": float(last["ATR"]) if not pd.isna(last.get("ATR")) else None,
         "ema_trend": _get_ema_trend(df, direction),
         "resolved": False,
     })
@@ -729,8 +842,15 @@ def store_tracked_signal(
     # Memory management: keep only last 200 trades
     if len(tracked_signals) > 200:
         tracked_signals[:] = tracked_signals[-200:]
-    
-    # Save to JSON for persistence
+
+    # Risk management: record trade open
+    if _RISK_MGMT_AVAILABLE:
+        try:
+            record_trade_open(confidence)
+        except Exception:
+            pass
+
+    # Debounced JSON persistence
     _save_tracked_signals_to_json()
 
 
@@ -878,7 +998,7 @@ def process_signal_list(
         _load_tracked_signals_from_json()
         process_signal_list._initialized = True
 
-    if df is None or len(df) < 200:
+    if df is None or len(df) < 20:
         return []
 
     now = _now()
@@ -888,15 +1008,45 @@ def process_signal_list(
     if daily_report:
         messages.append(daily_report)
 
-    # Fetch 1-minute data ONCE and reuse for all operations
+    # 1) Get 1-minute data — prefer market_cache, then fetcher, then None
     minute_df = None
-    if minute_data_fetcher is not None:
+    if _CACHE_AVAILABLE:
         try:
-            minute_df = minute_data_fetcher()
-            if minute_df is not None and len(minute_df) >= 200:
-                minute_df = add_indicators(minute_df)
+            minute_df = get_cached_1m_df()
+        except Exception:
+            pass
+
+    if minute_df is None and minute_data_fetcher is not None:
+        try:
+            raw_minute = minute_data_fetcher()
+            if raw_minute is not None and len(raw_minute) >= 20:
+                # Store in cache for future cycles
+                if _CACHE_AVAILABLE:
+                    try:
+                        set_cached_1m_df(raw_minute)
+                        minute_df = get_cached_1m_df()
+                    except Exception:
+                        pass
+                if minute_df is None:
+                    minute_df = add_indicators(raw_minute) if "EMA50" not in raw_minute.columns else raw_minute
         except Exception:
             minute_df = None
+
+    # Ensure main df has indicators (avoid recalculating if already present)
+    if "EMA50" not in df.columns:
+        df = add_indicators(df)
+
+    # Trigger periodic saves in background modules
+    if _RISK_MGMT_AVAILABLE:
+        try:
+            _rm_maybe_save()
+        except Exception:
+            pass
+    if _LEARNING_AVAILABLE:
+        try:
+            maybe_periodic_save()
+        except Exception:
+            pass
 
     # 1) Check for any tracked signals that have expired and report results
     try:
@@ -936,12 +1086,29 @@ def process_signal_list(
 
                 # update stats and prepare message
                 _update_stats(entry)
+
+                # Record outcome in learning engine
+                if _LEARNING_AVAILABLE:
+                    try:
+                        record_outcome(
+                            source=f"signal_{entry.get('direction', 'UNKNOWN').lower()}",
+                            result=entry["result"],
+                            confidence=float(entry.get("confidence") or 0),
+                        )
+                    except Exception:
+                        pass
+
+                # Record outcome in risk management
+                if _RISK_MGMT_AVAILABLE:
+                    try:
+                        record_trade_close(entry["result"])
+                    except Exception:
+                        pass
+
                 messages.append(_format_result_message(entry))
-                
-                # Save updated tracked signals to JSON
                 _save_tracked_signals_to_json()
     except Exception as e:
-        print(f"Result tracking error: {e}")
+        logger.warning("Result tracking error: %s", e)
 
     for signal in signal_list:
         try:
@@ -955,54 +1122,43 @@ def process_signal_list(
 
             base_key = _signal_key(signal_time, direction)
 
-            # Use cached 1-minute data for PRE-SIGNAL confidence when available.
             # Determine whether this is a 'next' signal for thresholding.
             is_next_signal = evaluated_signal_count > 0
-            base_threshold = 70 if is_next_signal else 75
+            base_threshold = 68 if is_next_signal else 72
             threshold = get_adaptive_trade_threshold(base_threshold)
 
-            # Prefer minute-level data for pre-signal calculation; fallback to provided df.
-            pre_df = minute_df if (minute_df is not None and len(minute_df) >= 200) else df
+            # Prefer cached 1-minute data; fallback to provided df.
+            pre_df = minute_df if (minute_df is not None and len(minute_df) >= 20) else df
             pre_confidence = calculate_confidence(pre_df, direction)
 
             seconds_to_entry = (signal_time - now).total_seconds()
             if PRE_SIGNAL_MIN_SECONDS <= seconds_to_entry <= PRE_SIGNAL_MAX_SECONDS and not signal.get("pre_sent"):
-                # Only send pre-signal when the confidence meets the same adaptive threshold
                 if pre_confidence >= threshold:
                     messages.append(_build_pre_message(signal, pre_confidence, pre_df))
                     signal["pre_sent"] = True
-                    # Persist the pre-calculated confidence so confirmation uses the same value
                     signal["pre_confidence"] = pre_confidence
-                    print(f"FINAL CONFIDENCE USED: {pre_confidence}%")
+                    logger.info("Pre-signal: %s %s confidence=%d%%", signal_time.strftime("%H:%M"), direction, pre_confidence)
 
             if abs((now - signal_time).total_seconds()) <= SIGNAL_WINDOW_SECONDS:
                 if base_key in processed_signals:
                     continue
 
-                signal_df = minute_df
+                signal_df = minute_df if (minute_df is not None and len(minute_df) >= 20) else df
 
-                if signal_df is None or len(signal_df) < 200:
-                    signal_df = df
-
-                # Use any pre-calculated confidence if present so pre-signal and confirmation match.
+                # Use pre-calculated confidence if present so pre-signal and confirmation match.
                 pre_conf = signal.get("pre_confidence")
                 is_next_signal = evaluated_signal_count > 0
-                if pre_conf is not None:
-                    confidence = pre_conf
-                else:
-                    confidence = calculate_confidence(signal_df, direction)
+                confidence = pre_conf if pre_conf is not None else calculate_confidence(signal_df, direction)
 
-                # Debug log final confidence used for decision
-                print(f"FINAL CONFIDENCE USED: {confidence}%")
+                logger.info("Signal evaluation: %s %s confidence=%d%% threshold=%d%%",
+                            signal_time.strftime("%H:%M"), direction, confidence, threshold)
 
-                # Re-check safety rules at confirmation time - if market weakens, skip confirmation
                 should_take, skip_reason = _should_take_signal(signal_df, direction, confidence, is_next_signal)
 
                 if should_take:
                     _, tp, sl = build_forex_targets(signal_df, direction, confidence)
                     expiry = signal_time + timedelta(minutes=5)
                     messages.append(_build_confirm_message(signal, confidence, expiry, tp, sl, signal_df))
-                    # Store confirmed signal for result tracking
                     try:
                         entry_price = float(signal_df.iloc[-1]["Close"])
                         store_tracked_signal(
@@ -1016,14 +1172,13 @@ def process_signal_list(
                             df=signal_df,
                         )
                     except Exception as e:
-                        print(f"store_tracked_signal error: {e}")
+                        logger.warning("store_tracked_signal error: %s", e)
                     signal["confirmed_sent"] = True
                     signal["martingale_confidence"] = confidence
                     confirmed_signal_count += 1
-                    print(f"Signal confirmed: {signal_time:%H:%M} {direction}")
+                    logger.info("Signal confirmed: %s %s", signal_time.strftime("%H:%M"), direction)
                 else:
-                    # Market weakened between pre-signal and confirmation - skip safely
-                    print(f"Skipping confirmation for {signal_time:%H:%M} {direction}: {skip_reason}")
+                    logger.info("Signal skipped: %s %s — %s", signal_time.strftime("%H:%M"), direction, skip_reason)
 
                 processed_signals.add(base_key)
                 evaluated_signal_count += 1
@@ -1039,35 +1194,24 @@ def process_signal_list(
                 MARTINGALE_PREALERT_MIN_SECONDS <= seconds_to_mg <= MARTINGALE_PREALERT_MAX_SECONDS
                 and not signal.get("martingale_prealert_sent")
             ):
-                # Prefer 1-minute data for martingale checks; fallback to main df
-                mg_df = minute_df if (minute_df is not None and len(minute_df) >= 200) else df
+                mg_df = minute_df if (minute_df is not None and len(minute_df) >= 20) else df
                 if _is_strong_martingale(mg_df, direction):
                     mg_confidence = calculate_confidence(mg_df, direction)
                     signal["martingale_confidence"] = mg_confidence
                     messages.append(_build_mg_pre_message(signal, mg_confidence, mg_df))
-                    print(f"FINAL CONFIDENCE USED: {mg_confidence}%")
                     signal["martingale_prealert_sent"] = True
+                    logger.info("MG pre-alert: %s %s confidence=%d%%", mg_time.strftime("%H:%M"), direction, mg_confidence)
 
             if abs((now - mg_time).total_seconds()) <= SIGNAL_WINDOW_SECONDS:
-                # Prefer 1-minute data for martingale confirmation; fallback to main df
-                mg_df = minute_df if (minute_df is not None and len(minute_df) >= 200) else df
+                mg_df = minute_df if (minute_df is not None and len(minute_df) >= 20) else df
                 if mg_key not in processed_signals and _is_strong_martingale(mg_df, direction):
                     mg_confidence = calculate_confidence(mg_df, direction)
                     signal["martingale_confidence"] = mg_confidence
-                    print(f"FINAL CONFIDENCE USED: {mg_confidence}%")
                     _, tp, sl = build_forex_targets(mg_df, direction, mg_confidence)
                     expiry = mg_time + timedelta(minutes=5)
                     messages.append(
-                        _build_mg_confirm_message(
-                            signal,
-                            mg_confidence,
-                            expiry,
-                            tp,
-                            sl,
-                            mg_df,
-                        )
+                        _build_mg_confirm_message(signal, mg_confidence, expiry, tp, sl, mg_df)
                     )
-                    # Store martingale confirmed signal
                     try:
                         entry_price = float(mg_df.iloc[-1]["Close"])
                         store_tracked_signal(
@@ -1081,12 +1225,12 @@ def process_signal_list(
                             df=mg_df,
                         )
                     except Exception as e:
-                        print(f"store_tracked_signal error: {e}")
+                        logger.warning("store_tracked_signal error: %s", e)
                     processed_signals.add(mg_key)
                     signal["martingale_confirmed_sent"] = True
-                    print(f"Signal confirmed: {mg_time:%H:%M} {direction}")
+                    logger.info("MG confirmed: %s %s", mg_time.strftime("%H:%M"), direction)
         except Exception as e:
-            print(f"Processing error: {e}")
+            logger.warning("Processing error: %s", e)
             continue
 
     return messages

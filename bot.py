@@ -1,9 +1,12 @@
+import logging
 import os
 import time
 from datetime import time as clock_time
 
 import pandas as pd
 import requests
+
+logger = logging.getLogger(__name__)
 
 # ONLY detect Railway (not BOT_TOKEN)
 if os.getenv("RAILWAY_ENVIRONMENT"):
@@ -22,6 +25,12 @@ from signal_list import (
     store_tracked_signal,
     update_signal_list,
 )
+
+try:
+    from market_cache import get_cached_1m_df, set_cached_1m_df
+    _CACHE_AVAILABLE = True
+except ImportError:
+    _CACHE_AVAILABLE = False
 
 PAIR = "EUR/USD"
 SLEEP_TIME = 120   # 2 minutes
@@ -159,10 +168,10 @@ def send_telegram(msg):
             "text": msg,
             "parse_mode": "Markdown"
         })
-        print("Telegram:", res.text)
+        logger.info("Telegram: %s", res.text)
 
     except Exception as e:
-        print("Telegram error:", e)
+        logger.warning("Telegram error: %s", e)
 
 
 def fetch_signal_text_from_telegram():
@@ -208,7 +217,7 @@ def fetch_signal_text_from_telegram():
         return latest_text
 
     except Exception as e:
-        print("Telegram input error:", e)
+        logger.warning("Telegram input error: %s", e)
         return None
 
 
@@ -217,7 +226,7 @@ def fetch_signal_text_from_telegram():
 # ==============================
 def get_data(interval):
     if not is_api_call_allowed():
-        print(f"API rate limit reached. Skipping {interval} data fetch.")
+        logger.info("API rate limit reached. Skipping %s data fetch.", interval)
         return None
 
     url = "https://api.twelvedata.com/time_series"
@@ -233,7 +242,7 @@ def get_data(interval):
     track_api_call()
 
     if "values" not in res:
-        print("API ERROR:", res)
+        logger.warning("API ERROR: %s", res)
 
         if res.get("code") == 429:
             send_telegram("*API Rate Limit Hit*\n\nWaiting 60 seconds before retry.")
@@ -294,7 +303,7 @@ def run_external_signal_engine(df, cached_minute_df=None):
 # MAIN LOOP
 # ==============================
 def run():
-    print("BOT RUNNING")
+    logger.info("BOT RUNNING")
     send_telegram("*Bot Started*\n\nSmart Mode Active.")
 
     last_signal_time = None
@@ -318,12 +327,12 @@ def run():
             market_open, _ = get_market_status()
 
             if not market_open:
-                print("Market closed — idle mode")
-                print(f"Next market open: {get_next_market_open():%Y-%m-%d %H:%M %Z}")
+                logger.info("Market closed — idle mode")
+                logger.info("Next market open: %s", get_next_market_open().strftime("%Y-%m-%d %H:%M %Z"))
                 time.sleep(get_idle_sleep_seconds())
                 continue
 
-            print("Market Open — Running")
+            logger.info("Market Open — Running")
 
             force_fast_mode = should_force_fast_mode()
 
@@ -342,7 +351,7 @@ def run():
                 and cached_candle_key == current_candle_key
             ):
                 df = cached_df.copy()
-                print(f"Using cached {interval} data")
+                logger.debug("Using cached %s data", interval)
             else:
                 df = get_data(interval)
 
@@ -373,10 +382,10 @@ def run():
             trade_threshold = get_adaptive_trade_threshold(75)
 
             # Debug: print final confidence used by bot decision path
-            print(f"FINAL CONFIDENCE USED: {confidence}%")
+            logger.debug("FINAL CONFIDENCE USED: %d%%", confidence)
 
             if confidence < trade_threshold:
-                print(f"Signal rejected - confidence too low: {confidence}% (threshold {trade_threshold}%)")
+                logger.info("Signal rejected - confidence too low: %d%% (threshold %d%%)", confidence, trade_threshold)
                 # 5) Run external signal processing after auto bot.
                 run_external_signal_engine(df, cached_minute_df)
                 time.sleep(sleep_time)
@@ -392,7 +401,7 @@ def run():
 
                     if cooldown_minutes < TRADE_COOLDOWN_MINUTES:
                         remaining = TRADE_COOLDOWN_MINUTES - cooldown_minutes
-                        print(f"Trade cooldown active - {remaining:.1f} min remaining")
+                        logger.info("Trade cooldown active - %.1f min remaining", remaining)
                         run_external_signal_engine(df, cached_minute_df)
                         time.sleep(sleep_time)
                         continue
@@ -400,7 +409,7 @@ def run():
                 news_blocked, news_time = is_high_impact_news_window()
 
                 if news_blocked:
-                    print(f"Trade blocked due to high-impact news at {news_time:%H:%M}")
+                    logger.info("Trade blocked due to high-impact news at %s", news_time.strftime("%H:%M"))
                     run_external_signal_engine(df, cached_minute_df)
                     time.sleep(sleep_time)
                     continue
@@ -408,12 +417,12 @@ def run():
                 current_candle_time = df.iloc[-1].get("CandleTime", df.index[-1])
 
                 if current_candle_time == last_signal_time:
-                    print("Duplicate signal skipped")
+                    logger.info("Duplicate signal skipped")
                     run_external_signal_engine(df, cached_minute_df)
                     time.sleep(sleep_time)
                     continue
 
-                print("Score:", confidence, grade)
+                logger.debug("Score:", confidence, grade)
 
                 send_telegram(f"""
 *PRE-SIGNAL*
@@ -462,7 +471,7 @@ Multiplier: {forex['multiplier']}
 Auto Close: {forex['auto_close']}
 """
 
-                print(msg)
+                logger.info(msg)
                 send_telegram(msg)
                 try:
                     entry_price = float(df.iloc[-1]["Close"])
@@ -479,20 +488,20 @@ Auto Close: {forex['auto_close']}
                         df=df,
                     )
                 except Exception as e:
-                    print("Tracking error:", e)
+                    logger.warning("Tracking error:", e)
 
                 last_signal_time = current_candle_time
                 last_trade_time = pd.Timestamp.now(tz="Asia/Kolkata")
 
             else:
-                print("No signal")
+                logger.info("No signal")
 
             # 5) Process external signal list with the same df.
             run_external_signal_engine(df, cached_minute_df)
             time.sleep(sleep_time)
 
         except Exception as e:
-            print("Error:", e)
+            logger.warning("Error:", e)
             time.sleep(60)
 
 
