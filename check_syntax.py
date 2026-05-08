@@ -5,6 +5,10 @@ import sys
 def check_syntax(directory):
     errors_found = False
     for root, dirs, files in os.walk(directory):
+        if '.venv' in dirs:
+            dirs.remove('.venv')
+        if '__pycache__' in dirs:
+            dirs.remove('__pycache__')
         for file in files:
             if file.endswith('.py'):
                 file_path = os.path.join(root, file)
