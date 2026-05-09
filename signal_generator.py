@@ -34,27 +34,79 @@ else:
 # DataFrame cache (fallback when API unavailable)
 # ──────────────────────────────────────────────────────────────
 _df_memory_cache: pd.DataFrame | None = None
+_df_memory_cache_time: datetime | None = None   # UTC wall-clock time of last save
+
+# Maximum age of a cached DataFrame before it is considered stale
+_DF_CACHE_MAX_AGE_SECONDS = 30 * 60  # 30 minutes
 
 
 def _save_df_cache(df: pd.DataFrame) -> None:
     """Persist DataFrame to disk so next API failure can use it."""
-    global _df_memory_cache
+    global _df_memory_cache, _df_memory_cache_time
     _df_memory_cache = df
+    _df_memory_cache_time = datetime.utcnow()
     try:
         df.to_pickle(DF_CACHE_FILE)
+        # Persist cache timestamp alongside the pickle so disk reloads can
+        # also check freshness after a process restart.
+        _ts_file = DF_CACHE_FILE + ".ts"
+        with open(_ts_file, "w") as f:
+            f.write(_df_memory_cache_time.isoformat())
     except Exception as e:
         logger.warning(f"DF cache save failed: {e}")
 
 
+def _get_df_cache_age_seconds() -> float | None:
+    """Return age of the in-memory cache in seconds, or None if not set."""
+    if _df_memory_cache_time is None:
+        return None
+    return (datetime.utcnow() - _df_memory_cache_time).total_seconds()
+
+
+def is_df_cache_fresh() -> bool:
+    """
+    Return True if the in-memory DataFrame cache is present AND was
+    saved within the last 30 minutes.  Always returns False when no
+    cache exists, so callers must handle a fresh-API path.
+    """
+    age = _get_df_cache_age_seconds()
+    if age is None:
+        return False
+    return age <= _DF_CACHE_MAX_AGE_SECONDS
+
+
 def _load_df_cache() -> pd.DataFrame | None:
-    """Load the latest cached DataFrame (memory first, then disk)."""
-    global _df_memory_cache
+    """
+    Load the latest cached DataFrame (memory first, then disk).
+    Rejects caches older than 30 minutes to prevent stale-data trading.
+    """
+    global _df_memory_cache, _df_memory_cache_time
     if _df_memory_cache is not None:
-        return _df_memory_cache
+        if is_df_cache_fresh():
+            return _df_memory_cache
+        logger.warning("Cached market data too old (>30 min) — rejecting in-memory cache.")
+        # Don't clear the object; the freshness gate is the guard.
+
     if os.path.exists(DF_CACHE_FILE):
         try:
+            # Check the timestamp file before bothering to unpickle
+            _ts_file = DF_CACHE_FILE + ".ts"
+            if os.path.exists(_ts_file):
+                with open(_ts_file, "r") as f:
+                    saved_at = datetime.fromisoformat(f.read().strip())
+                age_sec = (datetime.utcnow() - saved_at).total_seconds()
+                if age_sec > _DF_CACHE_MAX_AGE_SECONDS:
+                    logger.warning(
+                        f"Cached market data too old ({int(age_sec // 60)}m) — "
+                        "rejecting disk cache."
+                    )
+                    return None
             df = pd.read_pickle(DF_CACHE_FILE)
             _df_memory_cache = df
+            if os.path.exists(_ts_file):
+                _df_memory_cache_time = saved_at  # type: ignore[possibly-undefined]
+            else:
+                _df_memory_cache_time = datetime.utcnow()  # treat as fresh for this session
             logger.info("Loaded DataFrame from disk cache.")
             return df
         except Exception as e:
@@ -451,6 +503,15 @@ def generate_daily_signals():
 
     if df is None:
         logger.error("Failed to fetch data.")
+        return False
+
+    # Guard: reject stale fallback data so we never generate signals from
+    # candles that are more than 30 minutes old.
+    if not is_df_cache_fresh():
+        logger.warning(
+            "Cached market data too old — skipping daily signal generation "
+            "until fresh data is available."
+        )
         return False
 
     signals = calculate_recurring_strength(df)

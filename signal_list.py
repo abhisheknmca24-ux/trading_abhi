@@ -134,8 +134,66 @@ class SmartSignalManager:
         self.wins = sum(1 for t in resolved if t.get("result") == "WIN")
         self.losses = self.total_trades - self.wins
 
+    # ------------------------------------------------------------------
+    # Memory management
+    # ------------------------------------------------------------------
+    _PROCESSED_SIGNALS_MAX = 1_000
+
+    def cleanup_processed_signals(self) -> None:
+        """
+        Prune stale entries from processed_signals to prevent unbounded
+        RAM growth during long Railway uptime.
+
+        Strategy:
+          1. Remove keys whose HH:MM_DIRECTION pattern includes a date
+             prefix that is NOT today (e.g. "2025-01-01_15:05_CALL").
+          2. Retain all today's keys unconditionally (they protect against
+             duplicate execution on the current trading day).
+          3. If the set still exceeds _PROCESSED_SIGNALS_MAX after pruning,
+             discard the oldest alphabetical entries until within the cap.
+        """
+        today_str = date.today().isoformat()   # "YYYY-MM-DD"
+        before = len(self.processed_signals)
+
+        # Step 1 – drop dated entries that belong to a different day
+        to_remove: set[str] = set()
+        for key in self.processed_signals:
+            # Keys that carry an explicit date prefix look like:
+            # "YYYY-MM-DD_HH:MM_DIRECTION" or "YYYY-MM-DD_martingale_HH:MM_…"
+            if len(key) >= 10 and key[4] == "-" and key[7] == "-":
+                key_date = key[:10]
+                if key_date != today_str:
+                    to_remove.add(key)
+
+        self.processed_signals -= to_remove
+        after_date_prune = len(self.processed_signals)
+
+        # Step 2 – hard cap: drop the alphabetically earliest entries
+        excess = len(self.processed_signals) - self._PROCESSED_SIGNALS_MAX
+        if excess > 0:
+            sorted_keys = sorted(self.processed_signals)
+            self.processed_signals -= set(sorted_keys[:excess])
+
+        after = len(self.processed_signals)
+        removed_stale = before - after_date_prune
+        removed_cap   = after_date_prune - after
+
+        if removed_stale or removed_cap:
+            logger.info(
+                f"processed_signals cleanup completed: "
+                f"removed {removed_stale} stale-date entries, "
+                f"{removed_cap} over-cap entries. "
+                f"Remaining: {after}/{before}"
+            )
+        else:
+            logger.debug(
+                f"processed_signals cleanup: no action needed "
+                f"({after} entries)."
+            )
+
 manager = SmartSignalManager()
 manager.load()
+manager.cleanup_processed_signals()   # prune stale keys from previous day(s) on startup
 
 
 def _get_timezone():
@@ -1408,6 +1466,13 @@ def process_signal_list(
     daily_report = _maybe_build_daily_report(now)
     if daily_report:
         messages.append(daily_report)
+        # New trading day detected – prune yesterday's processed_signals
+        manager.cleanup_processed_signals()
+
+    # Safety valve: also clean up every time processed_signals grows large
+    # (catches long-running days where no midnight rollover occurs locally)
+    if len(manager.processed_signals) > manager._PROCESSED_SIGNALS_MAX:
+        manager.cleanup_processed_signals()
 
     # Fetch 1-minute data ONCE and reuse for all operations
     minute_df = None
