@@ -18,9 +18,11 @@ from indicators import add_indicators, calculate_score
 from signal_list import (
     apply_signal_text,
     get_adaptive_trade_threshold,
+    manager as signal_manager,
     process_signal_list,
     should_force_fast_mode,
     store_tracked_signal,
+    TRADE_LOCK_SECONDS,
     update_signal_list,
 )
 from market_safety import run_market_safety
@@ -55,16 +57,29 @@ def track_api_call():
     API_CALL_TIMES[:] = [t for t in API_CALL_TIMES if now - t < 60]
 
 
-def is_api_call_allowed():
+SKIPPED_API_CALLS_COUNT = 0
+
+def is_api_call_allowed(interval_name: str = "API"):
     """Check if we can make another API call within rate limit."""
+    global SKIPPED_API_CALLS_COUNT
     now = time.time()
+    
+    # Periodically clean up old timestamps to avoid long-term memory growth
+    API_CALL_TIMES[:] = [t for t in API_CALL_TIMES if now - t < 60]
+    
     if now < _rate_limit_pause_until:
         remaining = int(_rate_limit_pause_until - now)
-        logger.info(f"Emergency cooldown active — skipping API call ({remaining}s remaining)")
+        SKIPPED_API_CALLS_COUNT += 1
+        logger.info(f"Emergency cooldown active — skipping {interval_name} call ({remaining}s remaining, total skipped: {SKIPPED_API_CALLS_COUNT})")
         return False
-    # Remove calls older than 60 seconds
-    recent_calls = [t for t in API_CALL_TIMES if now - t < 60]
-    return len(recent_calls) < API_CALLS_PER_MINUTE_LIMIT
+    
+    allowed = len(API_CALL_TIMES) < API_CALLS_PER_MINUTE_LIMIT
+    
+    if not allowed:
+        SKIPPED_API_CALLS_COUNT += 1
+        logger.info(f"Rate limit reached — skipping {interval_name} call (total skipped: {SKIPPED_API_CALLS_COUNT})")
+        
+    return allowed
 
 
 if not TD_API_KEY:
@@ -150,18 +165,65 @@ def is_high_impact_news_window(now=None):
 # ==============================
 # TELEGRAM
 # ==============================
-def send_telegram(msg):
-    try:
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-        res = requests.post(url, data={
-            "chat_id": CHAT_ID,
-            "text": msg,
-            "parse_mode": "Markdown"
-        })
-        logger.info(f"Telegram: {res.text}")
 
-    except Exception as e:
-        logger.error(f"Telegram error: {e}")
+_TELEGRAM_MAX_RETRIES = 3
+_TELEGRAM_RETRY_DELAY = 2       # seconds between retries
+_TELEGRAM_TIMEOUT = 15          # seconds per request
+
+# HTTP status codes that are worth retrying (transient server-side issues)
+_TELEGRAM_RETRYABLE_HTTP = {429, 500, 502, 503, 504}
+
+
+def send_telegram(msg):
+    """
+    Send a Telegram message with up to 3 automatic retries on transient failures.
+
+    Retries on:
+      - requests.Timeout / requests.ConnectionError  (network-level)
+      - HTTP 429 (rate limit) and 5xx (server error) responses
+
+    Permanent 4xx errors (except 429) fail immediately — no retry.
+    Never raises; failures are logged and silently discarded to keep the bot alive.
+    """
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": CHAT_ID,
+        "text": msg,
+        "parse_mode": "Markdown",
+    }
+
+    last_error = None
+    for attempt in range(1, _TELEGRAM_MAX_RETRIES + 1):
+        try:
+            res = requests.post(url, data=payload, timeout=_TELEGRAM_TIMEOUT)
+
+            if res.status_code == 200:
+                logger.info("Telegram message sent successfully")
+                return
+
+            if res.status_code in _TELEGRAM_RETRYABLE_HTTP:
+                last_error = f"HTTP {res.status_code}: {res.text[:120]}"
+                if attempt < _TELEGRAM_MAX_RETRIES:
+                    logger.warning(f"Telegram retry {attempt}/{_TELEGRAM_MAX_RETRIES} — {last_error}")
+                    time.sleep(_TELEGRAM_RETRY_DELAY)
+                continue  # retry
+
+            # Non-retryable HTTP error (e.g. 400 Bad Request, 401 Unauthorized)
+            logger.error(f"Telegram permanent error HTTP {res.status_code}: {res.text[:200]}")
+            return
+
+        except (requests.Timeout, requests.ConnectionError) as e:
+            last_error = str(e)
+            if attempt < _TELEGRAM_MAX_RETRIES:
+                logger.warning(f"Telegram retry {attempt}/{_TELEGRAM_MAX_RETRIES} — {type(e).__name__}: {e}")
+                time.sleep(_TELEGRAM_RETRY_DELAY)
+
+        except Exception as e:
+            # Unexpected error — log and give up immediately
+            logger.error(f"Telegram unexpected error: {e}")
+            return
+
+    logger.error(f"Telegram failed after {_TELEGRAM_MAX_RETRIES} retries. Last error: {last_error}")
 
 
 def fetch_signal_text_from_telegram():
@@ -215,8 +277,7 @@ def fetch_signal_text_from_telegram():
 # DATA FETCH
 # ==============================
 def get_data(interval):
-    if not is_api_call_allowed():
-        logger.info(f"API rate limit reached. Skipping {interval} data fetch.")
+    if not is_api_call_allowed(interval):
         return None
 
     url = "https://api.twelvedata.com/time_series"
@@ -271,7 +332,7 @@ def run_external_signal_engine(df, cached_minute_df=None):
         fallback_df = None
         if cached_minute_df is not None and len(cached_minute_df) >= 200:
             fallback_df = cached_minute_df
-        elif is_api_call_allowed():
+        elif is_api_call_allowed("fallback 5min"):
             try:
                 fallback_df = get_data("5min")
             except Exception:
@@ -283,7 +344,7 @@ def run_external_signal_engine(df, cached_minute_df=None):
     if cached_minute_df is not None:
         minute_data_fetcher = lambda: cached_minute_df
     else:
-        minute_data_fetcher = lambda: get_data("1min") if is_api_call_allowed() else None
+        minute_data_fetcher = lambda: get_data("1min") if is_api_call_allowed("1min") else None
 
     signal_messages = process_signal_list(df, minute_data_fetcher=minute_data_fetcher)
     for signal_message in signal_messages[:MAX_SIGNAL_MESSAGES_PER_CYCLE]:
@@ -314,6 +375,7 @@ def run():
             if not market_open:
                 logger.info("Market closed — idle mode")
                 logger.info(f"Next market open: {get_next_market_open():%Y-%m-%d %H:%M %Z}")
+                cache.cleanup_stale_cache()
                 time.sleep(get_idle_sleep_seconds())
                 continue
 
@@ -377,6 +439,19 @@ def run():
                     if cooldown_minutes < TRADE_COOLDOWN_MINUTES:
                         remaining = TRADE_COOLDOWN_MINUTES - cooldown_minutes
                         logger.info(f"Trade cooldown active - {remaining:.1f} min remaining")
+                        run_external_signal_engine(df, cached_minute_df)
+                        time.sleep(sleep_time)
+                        continue
+
+                # --- Global trade lock check (auto-trade) ---
+                if signal_manager.last_confirmed_trade_time is not None:
+                    elapsed = (now - signal_manager.last_confirmed_trade_time).total_seconds()
+                    if elapsed < TRADE_LOCK_SECONDS:
+                        remaining_lock = int(TRADE_LOCK_SECONDS - elapsed)
+                        logger.warning(
+                            f"Trade lock active — blocking auto-trade "
+                            f"({remaining_lock}s remaining). Trade skipped."
+                        )
                         run_external_signal_engine(df, cached_minute_df)
                         time.sleep(sleep_time)
                         continue
@@ -465,6 +540,7 @@ Auto Close: {forex['auto_close']}
                     logger.error(f"Tracking error: {e}")
 
                 last_trade_time = pd.Timestamp.now(tz="Asia/Kolkata")
+                signal_manager.last_confirmed_trade_time = last_trade_time  # Update global trade lock
 
             else:
                 logger.debug(f"Candle {current_candle_time}: No automated signal found.")

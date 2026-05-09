@@ -151,9 +151,9 @@ def decide_direction_live(df: pd.DataFrame) -> tuple[str, int]:
     Never returns a hardcoded direction – always calculated from live data.
     """
     if df is None or len(df) < 50:
-        # Absolute fallback – market data unavailable; default to neutral guess
-        logger.warning("Insufficient data for live direction decision; defaulting CALL.")
-        return "CALL", 40
+        # Absolute fallback – market data unavailable; default to None
+        logger.warning("Insufficient data for live direction decision.")
+        return None, 0
 
     last = df.iloc[-1]
     prev = df.iloc[-2] if len(df) >= 2 else last
@@ -226,15 +226,23 @@ def decide_direction_live(df: pd.DataFrame) -> tuple[str, int]:
         pass
 
     total_possible = 100
-    if call_score >= put_score:
+    if call_score > put_score:
         direction = "CALL"
         confidence = int((call_score / total_possible) * 100)
-    else:
+    elif put_score > call_score:
         direction = "PUT"
         confidence = int((put_score / total_possible) * 100)
+    else:
+        # Tie or 0-0 failure
+        direction = None
+        confidence = 0
 
     confidence = max(0, min(confidence, 99))
-    logger.info(f"Live direction: {direction} | CALL={call_score} PUT={put_score} | Confidence={confidence}%")
+    if direction:
+        logger.info(f"Live direction: {direction} | CALL={call_score} PUT={put_score} | Confidence={confidence}%")
+    else:
+        logger.warning(f"No clear direction found: CALL={call_score} PUT={put_score}")
+    
     return direction, confidence
 
 
@@ -293,9 +301,11 @@ def calculate_recurring_strength(df):
         if not (13 * 60 <= ist_minutes <= 22 * 60):
             continue
 
+        ist_time_str = f"{ist_minutes // 60:02d}:{ist_minutes % 60:02d}"
+
         if conf_call >= 70:
             call_candidates.append({
-                "time": t,
+                "time": ist_time_str,
                 "pair": PAIR,
                 "direction": "CALL",
                 "confidence": int(conf_call)
@@ -303,7 +313,7 @@ def calculate_recurring_strength(df):
 
         if conf_put >= 70:
             put_candidates.append({
-                "time": t,
+                "time": ist_time_str,
                 "pair": PAIR,
                 "direction": "PUT",
                 "confidence": int(conf_put)
@@ -312,29 +322,100 @@ def calculate_recurring_strength(df):
     call_candidates.sort(key=lambda x: x["confidence"], reverse=True)
     put_candidates.sort(key=lambda x: x["confidence"], reverse=True)
 
-    total_target = 12
-    max_one_side = 8
-
-    calls = call_candidates[:max_one_side]
-    puts = put_candidates[:max_one_side]
-    combined = calls + puts
+    combined = call_candidates + put_candidates
     combined.sort(key=lambda x: x["confidence"], reverse=True)
+
+    total_target = 12
+    max_dominance = 0.70
+    # Minimum confidence required for opposite-direction balancing signals
+    BALANCE_MIN_CONFIDENCE = 65
 
     final_signals = []
     c_count = 0
     p_count = 0
 
+    available_c = len(call_candidates)
+    available_p = len(put_candidates)
+
+    # ── Pass 1: standard selection at ≥70 confidence ─────────────────────────
     for s in combined:
         if len(final_signals) >= total_target:
             break
+
         if s["direction"] == "CALL":
-            if c_count < max_one_side:
-                final_signals.append(s)
-                c_count += 1
+            max_possible_p = min(available_p, total_target - (c_count + 1))
+            # Allow at least 2 signals to avoid empty outputs on low-volatility days
+            max_allowed = max(2, (c_count + 1 + max_possible_p) * max_dominance)
+            if (c_count + 1) > max_allowed:
+                continue
+            final_signals.append(s)
+            c_count += 1
         else:
-            if p_count < max_one_side:
-                final_signals.append(s)
-                p_count += 1
+            max_possible_c = min(available_c, total_target - (p_count + 1))
+            max_allowed = max(2, (p_count + 1 + max_possible_c) * max_dominance)
+            if (p_count + 1) > max_allowed:
+                continue
+            final_signals.append(s)
+            p_count += 1
+
+    # ── Pass 2: rebalancing – soften dominance using ≥65-confidence opposites ─
+    # Only triggers when one direction exceeds the 70% cap after Pass 1.
+    total_selected = len(final_signals)
+    if total_selected >= 2:
+        dominant = "CALL" if c_count > p_count else "PUT"
+        minority = "PUT" if dominant == "CALL" else "CALL"
+        dominant_count = c_count if dominant == "CALL" else p_count
+        minority_count = p_count if dominant == "CALL" else c_count
+
+        dominance_ratio = dominant_count / total_selected if total_selected > 0 else 0
+
+        if dominance_ratio > max_dominance:
+            # Collect minority candidates that meet the lower threshold but were
+            # excluded from Pass 1 (conf < 70 or simply not yet included).
+            selected_times = {s["time"] for s in final_signals}
+            minority_pool = [
+                s for s in (put_candidates if minority == "PUT" else call_candidates)
+                if s["confidence"] >= BALANCE_MIN_CONFIDENCE
+                and s["time"] not in selected_times
+            ]
+            minority_pool.sort(key=lambda x: x["confidence"], reverse=True)
+
+            # How many swaps do we need to bring dominance to ≤70%?
+            # dominance_ratio_after = (dominant_count - swaps) / total_selected
+            # We want (dominant_count - swaps) / total_selected ≤ max_dominance
+            max_dominant_allowed = int(total_selected * max_dominance)
+            swaps_needed = dominant_count - max_dominant_allowed
+
+            for extra in minority_pool:
+                if swaps_needed <= 0:
+                    break
+                # Remove the weakest dominant-direction signal to make room
+                dominant_signals = [
+                    s for s in final_signals if s["direction"] == dominant
+                ]
+                if not dominant_signals:
+                    break
+                weakest = min(dominant_signals, key=lambda x: x["confidence"])
+                if weakest["confidence"] > extra["confidence"]:
+                    # The weakest dominant signal is still stronger; stop swapping
+                    logger.info(
+                        f"[Balance] Stopping swap: weakest {dominant} conf={weakest['confidence']}% "
+                        f"> opposite {extra['confidence']}%"
+                    )
+                    break
+                final_signals.remove(weakest)
+                final_signals.append(extra)
+                if dominant == "CALL":
+                    c_count -= 1
+                    p_count += 1
+                else:
+                    p_count -= 1
+                    c_count += 1
+                swaps_needed -= 1
+                logger.info(
+                    f"[Balance] Swapped out {dominant} conf={weakest['confidence']}% "
+                    f"for {minority} conf={extra['confidence']}% at {extra['time']}"
+                )
 
     final_signals.sort(key=lambda x: x["time"])
     return final_signals
@@ -419,6 +500,11 @@ def generate_forced_daily_signals(df: pd.DataFrame | None = None) -> list[dict]:
 
     # 2. Calculate live direction
     direction, confidence = decide_direction_live(df)
+    
+    if direction is None:
+        logger.warning("Skipping forced signal generation due to missing live direction (API/data failure).")
+        return []
+
     low_confidence = confidence < FORCE_SIGNAL_CONFIDENCE_THRESHOLD
 
     if low_confidence:
@@ -464,7 +550,21 @@ def generate_forced_daily_signals(df: pd.DataFrame | None = None) -> list[dict]:
     forced_times = {FORCE_DIRECT_TIME, FORCE_MARTINGALE_TIME}
     existing = [s for s in existing if s.get("time") not in forced_times]
 
-    merged = existing + forced_signals
+    # 5. Filter by session (13:00 - 22:00 IST)
+    all_signals = existing + forced_signals
+    filtered = []
+    for s in all_signals:
+        t_str = s.get("time")
+        if not t_str: continue
+        try:
+            h, m = map(int, t_str.split(":"))
+            total_m = h * 60 + m
+            if 13 * 60 <= total_m <= 22 * 60:
+                filtered.append(s)
+        except Exception:
+            continue
+
+    merged = filtered
     merged.sort(key=lambda x: x.get("time", ""))
 
     try:

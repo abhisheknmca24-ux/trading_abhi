@@ -19,7 +19,7 @@ def check_market_session():
         return False, "Prime session active", 0
         
     # WEAK SESSION: Convert weakness into small confidence penalty instead of hard reject
-    return False, "Outside prime session (Weak liquidity)", 15
+    return False, "Outside prime session (Weak liquidity)", 5
 
 def check_sideways_market(df):
     """Detect if the market is moving too sideways (lack of trend)."""
@@ -168,6 +168,9 @@ def run_market_safety(df, direction):
     if is_dead:
         return False, atr_msg, atr_penalty
     total_penalty += atr_penalty
+        
+    # Cap total combined penalty to 25 to avoid over-filtering
+    total_penalty = min(total_penalty, 25)
         
     return True, "Market conditions validated", total_penalty
 

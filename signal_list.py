@@ -13,6 +13,8 @@ import pandas as pd
 from indicators import add_indicators
 from market_safety import run_market_safety
 from confirmation_engine import validate_live_signal
+from signal_generator import decide_direction_live
+from learning_engine import learning_engine
 
 try:
     from zoneinfo import ZoneInfo
@@ -47,6 +49,10 @@ class SignalEntry:
     raw_line: str
 
 
+# Global trade lock: minimum gap between any two confirmed trades (seconds)
+TRADE_LOCK_SECONDS = 5 * 60  # 5 minutes
+
+
 class SmartSignalManager:
     def __init__(self):
         self.active_signals = []
@@ -64,6 +70,11 @@ class SmartSignalManager:
         self.storage_file = "smart_signals.json"
         self.last_signal_lines = []
         self._initialized = False
+        self.skip_message_times = []
+        # Global trade lock – updated whenever any signal type is confirmed
+        self.last_confirmed_trade_time: Optional[datetime] = None
+        # Overlap tracking: timestamps of every forced-signal trade-lock bypass
+        self.forced_overlap_times: List[datetime] = []
 
     def load(self):
         if not os.path.exists(self.storage_file):
@@ -82,6 +93,15 @@ class SmartSignalManager:
                 if self.last_daily_report_date:
                     self.last_daily_report_date = date.fromisoformat(self.last_daily_report_date)
                 
+                self.processed_signals = set(data.get("processed_signals", []))
+
+                raw_lctt = data.get("last_confirmed_trade_time")
+                if raw_lctt:
+                    try:
+                        self.last_confirmed_trade_time = datetime.fromisoformat(raw_lctt)
+                    except Exception:
+                        self.last_confirmed_trade_time = None
+                
                 self.recalculate_stats()
                 logger.info(f"Loaded {len(self.tracked_trades)} trades from {self.storage_file}")
         except Exception as e:
@@ -91,7 +111,9 @@ class SmartSignalManager:
         try:
             data = {
                 "tracked_trades": [],
-                "last_daily_report_date": self.last_daily_report_date.isoformat() if self.last_daily_report_date else None
+                "last_daily_report_date": self.last_daily_report_date.isoformat() if self.last_daily_report_date else None,
+                "processed_signals": list(self.processed_signals),
+                "last_confirmed_trade_time": self.last_confirmed_trade_time.isoformat() if self.last_confirmed_trade_time else None,
             }
             for t in self.tracked_trades:
                 entry = dict(t)
@@ -457,14 +479,14 @@ def validate_martingale_signal(df: pd.DataFrame, direction: str) -> bool:
     prev = df.iloc[-2]
 
     if direction == "CALL":
-        if last["RSI"] <= 60:
+        if last["RSI"] <= 57:
             return False
         if last["RSI"] <= prev["RSI"]:
             return False
         if float(last["Close"]) <= float(last["Open"]):
             return False
     else:
-        if last["RSI"] >= 40:
+        if last["RSI"] >= 43:
             return False
         if last["RSI"] >= prev["RSI"]:
             return False
@@ -791,7 +813,7 @@ def _is_strong_martingale(df: pd.DataFrame, direction: str) -> bool:
 
 
 def _should_take_signal(df: pd.DataFrame, direction: str, confidence: int, is_next_signal: bool) -> tuple[bool, str, int]:
-    safety_ok, safety_reason = _check_safety_rules(df, direction, confidence)
+    safety_ok, safety_reason, confidence = _check_safety_rules(df, direction, confidence)
     if not safety_ok:
         return False, safety_reason, confidence
 
@@ -1181,6 +1203,60 @@ def _build_forced_confirm_message(signal_time: datetime, direction: str, confide
     )
 
 
+
+# ──────────────────────────────────────────────────────────────
+# Forced-signal overlap diagnostics (non-blocking)
+# ──────────────────────────────────────────────────────────────
+
+# Window used when counting repeated bypasses
+_OVERLAP_WARNING_WINDOW_SECONDS = 15 * 60   # 15 minutes
+_OVERLAP_WARNING_THRESHOLD = 2              # warn when >= this many in window
+
+
+def _log_forced_overlap(
+    now: datetime,
+    forced_signal_time: datetime,
+    last_trade_time: datetime,
+    elapsed: float,
+) -> None:
+    """
+    Log detailed diagnostics when a forced signal bypasses the global trade lock.
+
+    Tracks every bypass event in ``manager.forced_overlap_times``.
+    If 2 or more bypass events occur within 15 minutes, emits an escalated
+    WARNING to signal potential over-trading in the forced window.
+
+    Never blocks or modifies the forced signal itself.
+    """
+    remaining = int(TRADE_LOCK_SECONDS - elapsed)
+    overlap_duration = int(elapsed)  # seconds since the previous trade
+
+    logger.warning(
+        f"[FORCED] Trade lock bypassed — forced signal at {forced_signal_time:%H:%M} "
+        f"fired while lock active | "
+        f"Active trade time: {last_trade_time:%H:%M:%S} | "
+        f"Overlap duration: {overlap_duration}s | "
+        f"Lock remaining: {remaining}s"
+    )
+
+    # Record this bypass
+    manager.forced_overlap_times.append(now)
+
+    # Prune events outside the 15-minute window
+    cutoff = now - timedelta(seconds=_OVERLAP_WARNING_WINDOW_SECONDS)
+    manager.forced_overlap_times = [
+        t for t in manager.forced_overlap_times if t >= cutoff
+    ]
+
+    recent_count = len(manager.forced_overlap_times)
+    if recent_count >= _OVERLAP_WARNING_THRESHOLD:
+        logger.warning(
+            f"[FORCED] ⚠️ OVERLAP WARNING: {recent_count} forced bypass(es) detected "
+            f"within the last {_OVERLAP_WARNING_WINDOW_SECONDS // 60} minutes. "
+            f"Potential overlapping trades — review forced signal schedule."
+        )
+
+
 def _process_forced_signals(
     messages: List[str],
     active_signals: List[dict],
@@ -1227,6 +1303,9 @@ def _process_forced_signals(
             if PRE_SIGNAL_MIN_SECONDS <= seconds_to_entry <= PRE_SIGNAL_MAX_SECONDS and not signal.get("pre_sent"):
                 # Re-calculate live direction for the pre-signal message
                 live_dir, live_conf = decide_direction_live(work_df)
+                if live_dir is None:
+                    logger.warning("Forced signal skipped due to missing live direction.")
+                    continue
                 signal["direction"] = live_dir
                 signal["stored_confidence"] = live_conf
                 low_confidence = live_conf < FORCED_SIGNAL_LOW_CONF_THRESHOLD
@@ -1240,8 +1319,23 @@ def _process_forced_signals(
 
             # ── CONFIRMATION (within SIGNAL_WINDOW_SECONDS of entry) ──────
             if abs(seconds_to_entry) <= SIGNAL_WINDOW_SECONDS and not signal.get("confirmed_sent"):
+                # --- Global trade lock check (forced signals may bypass) ---
+                if manager.last_confirmed_trade_time is not None:
+                    elapsed = (now - manager.last_confirmed_trade_time).total_seconds()
+                    if elapsed < TRADE_LOCK_SECONDS:
+                        _log_forced_overlap(
+                            now=now,
+                            forced_signal_time=signal_time,
+                            last_trade_time=manager.last_confirmed_trade_time,
+                            elapsed=elapsed,
+                        )
+                        # Forced signals bypass the lock — log but do NOT skip
+
                 # Re-check direction live – may flip from original
                 live_dir, live_conf = decide_direction_live(work_df)
+                if live_dir is None:
+                    logger.warning("Forced signal skipped due to missing live direction.")
+                    continue
                 direction_flipped = live_dir != signal["direction"]
                 if direction_flipped:
                     logger.info(f"[FORCED] Direction flipped {signal['direction']} → {live_dir} at confirmation")
@@ -1269,6 +1363,7 @@ def _process_forced_signals(
                 signal["confirmed_sent"] = True
                 signal["martingale_confidence"] = live_conf
                 manager.processed_signals.add(forced_key)
+                manager.last_confirmed_trade_time = now  # Update global trade lock
 
                 # Track trade for performance analytics
                 try:
@@ -1450,6 +1545,19 @@ def process_signal_list(
                 logger.debug(f"FINAL CONFIDENCE USED: {confidence}%")
 
                 if should_take:
+                    # --- Global trade lock check (regular signals) ---
+                    if manager.last_confirmed_trade_time is not None:
+                        elapsed = (now - manager.last_confirmed_trade_time).total_seconds()
+                        if elapsed < TRADE_LOCK_SECONDS:
+                            remaining = int(TRADE_LOCK_SECONDS - elapsed)
+                            logger.warning(
+                                f"Trade lock active — blocking {signal_time:%H:%M} {direction} "
+                                f"({remaining}s remaining). Trade skipped."
+                            )
+                            manager.processed_signals.add(base_key)
+                            manager.evaluated_signal_count += 1
+                            continue
+
                     _, tp, sl = build_forex_targets(signal_df, direction, confidence)
                     expiry = signal_time + timedelta(minutes=5)
                     messages.append(_build_confirm_message(signal, confidence, expiry, tp, sl, signal_df))
@@ -1472,20 +1580,24 @@ def process_signal_list(
                     signal["confirmed_sent"] = True
                     signal["martingale_confidence"] = confidence
                     manager.confirmed_signal_count += 1
+                    manager.last_confirmed_trade_time = now  # Update global trade lock
                     logger.info(f"Signal confirmed: {signal_time:%H:%M} {direction}")
                 else:
                     # Market weakened between pre-signal and confirmation - skip safely
                     logger.info(f"Skipping confirmation for {signal_time:%H:%M} {direction}: {skip_reason}")
                     if signal.get("pre_sent"):
-                        skip_msg = (
-                            f"⚠️ *SIGNAL SKIPPED*\n\n"
-                            f"Pair: {signal.get('pair', 'EURUSD')}\n"
-                            f"Time: {signal_time:%H:%M}\n\n"
-                            f"Signal skipped due to weak market:\n"
-                            f"{skip_reason}"
-                        )
-                        # DO NOT append skip_msg to prevent Telegram spam
-                        # messages.append(skip_msg)
+                        one_hour_ago = now - timedelta(hours=1)
+                        manager.skip_message_times = [t for t in manager.skip_message_times if t > one_hour_ago]
+                        
+                        if len(manager.skip_message_times) < 5:
+                            skip_msg = (
+                                f"⚠️ *SIGNAL SKIPPED*\n"
+                                f"Reason: {skip_reason}"
+                            )
+                            messages.append(skip_msg)
+                            manager.skip_message_times.append(now)
+                        else:
+                            logger.info(f"Skip message suppressed (rate limit reached) for {signal_time:%H:%M} {direction}")
 
                 manager.processed_signals.add(base_key)
                 manager.evaluated_signal_count += 1
@@ -1514,6 +1626,18 @@ def process_signal_list(
                 # Prefer 1-minute data for martingale confirmation; fallback to main df
                 mg_df = minute_df if (minute_df is not None and len(minute_df) >= 200) else df
                 if mg_key not in manager.processed_signals and _is_strong_martingale(mg_df, direction):
+                    # --- Global trade lock check (martingale) ---
+                    if manager.last_confirmed_trade_time is not None:
+                        elapsed = (now - manager.last_confirmed_trade_time).total_seconds()
+                        if elapsed < TRADE_LOCK_SECONDS:
+                            remaining = int(TRADE_LOCK_SECONDS - elapsed)
+                            logger.warning(
+                                f"Trade lock active — blocking martingale {mg_time:%H:%M} {direction} "
+                                f"({remaining}s remaining). Trade skipped."
+                            )
+                            manager.processed_signals.add(mg_key)
+                            continue
+
                     mg_confidence = calculate_confidence(mg_df, direction)
                     signal["martingale_confidence"] = mg_confidence
                     logger.debug(f"FINAL CONFIDENCE USED: {mg_confidence}%")
@@ -1547,6 +1671,7 @@ def process_signal_list(
                         logger.error(f"store_tracked_signal error: {e}")
                     manager.processed_signals.add(mg_key)
                     signal["martingale_confirmed_sent"] = True
+                    manager.last_confirmed_trade_time = now  # Update global trade lock
                     logger.info(f"Signal confirmed: {mg_time:%H:%M} {direction}")
         except Exception as e:
             logger.error(f"Processing error: {e}")

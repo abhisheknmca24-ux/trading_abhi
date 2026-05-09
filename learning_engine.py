@@ -7,6 +7,7 @@ class LearningEngine:
     def __init__(self, memory_file="trade_memory.json"):
         self.memory_file = memory_file
         self.memory = self._load_memory()
+        self.trades_since_cleanup = 0
         self._cleanup_old_memory()
         
     def _load_memory(self):
@@ -27,21 +28,25 @@ class LearningEngine:
             logger.error(f"Error saving learning memory: {e}")
 
     def _cleanup_old_memory(self):
-        """Keep ONLY last 14 days memory. Auto remove older data."""
+        """Keep ONLY last 14 days memory and cap at 500 entries. Auto remove older data."""
         cutoff_date = datetime.now() - timedelta(days=14)
         original_length = len(self.memory)
         
+        # 1. Filter by date
         valid_memory = []
         for trade in self.memory:
             try:
-                # Handle possible missing or malformed timestamps
                 ts_str = trade.get("timestamp", datetime.now().isoformat())
                 trade_date = datetime.fromisoformat(ts_str)
                 if trade_date >= cutoff_date:
                     valid_memory.append(trade)
             except ValueError:
-                pass # Skip invalid timestamps
+                pass
                 
+        # 2. Enforce hard cap of 500 (keep latest)
+        if len(valid_memory) > 500:
+            valid_memory = valid_memory[-500:]
+            
         self.memory = valid_memory
         
         if len(self.memory) < original_length:
@@ -64,6 +69,11 @@ class LearningEngine:
         }
         self.memory.append(trade_data)
         self._save_memory()
+        
+        self.trades_since_cleanup += 1
+        if self.trades_since_cleanup >= 20:
+            self._cleanup_old_memory()
+            self.trades_since_cleanup = 0
 
     def get_adaptive_adjustment(self, time_of_day: str, direction: str, confidence: int, atr: float, rsi: float, source: str = "telegram") -> int:
         """
