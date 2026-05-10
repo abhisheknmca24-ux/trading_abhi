@@ -1,7 +1,7 @@
 from logger import logger
 import os
-import json
 from datetime import datetime, timedelta
+from persistence import safe_load_json, safe_save_json
 
 class LearningEngine:
     def __init__(self, memory_file="trade_memory.json"):
@@ -11,21 +11,10 @@ class LearningEngine:
         self._cleanup_old_memory()
         
     def _load_memory(self):
-        if os.path.exists(self.memory_file):
-            try:
-                with open(self.memory_file, "r") as f:
-                    return json.load(f)
-            except Exception as e:
-                logger.error(f"Error loading learning memory: {e}")
-                return []
-        return []
+        return safe_load_json(self.memory_file, default=[])
 
     def _save_memory(self):
-        try:
-            with open(self.memory_file, "w") as f:
-                json.dump(self.memory, f, indent=4)
-        except Exception as e:
-            logger.error(f"Error saving learning memory: {e}")
+        safe_save_json(self.memory_file, self.memory, indent=4)
 
     def _cleanup_old_memory(self):
         """Keep ONLY last 14 days memory and cap at 500 entries. Auto remove older data."""

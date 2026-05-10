@@ -223,7 +223,7 @@ def send_telegram(msg):
             logger.error(f"Telegram unexpected error: {e}")
             return
 
-    logger.error(f"Telegram failed after {_TELEGRAM_MAX_RETRIES} retries. Last error: {last_error}")
+    logger.error("Telegram delivery failed after retries")
 
 
 def fetch_signal_text_from_telegram():

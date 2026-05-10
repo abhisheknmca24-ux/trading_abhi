@@ -1,5 +1,15 @@
 from datetime import datetime, timezone
 import os
+import time
+import requests
+import pandas as pd
+from logger import logger
+
+_NEWS_CACHE = {
+    "data": [],
+    "last_fetched": 0
+}
+
 
 # London Session: 08:00 - 17:00 UTC
 # NY Session: 13:00 - 22:00 UTC
@@ -20,6 +30,62 @@ def check_market_session():
         
     # WEAK SESSION: Convert weakness into small confidence penalty instead of hard reject
     return False, "Outside prime session (Weak liquidity)", 5
+
+def check_high_impact_news():
+    """
+    Check if we are within 15 mins of a high-impact news event.
+    Target keywords: CPI, NFP, FOMC, Interest Rate Decision, ECB, Powell
+    """
+    global _NEWS_CACHE
+    now = time.time()
+    
+    # Fetch at most once per hour
+    if now - _NEWS_CACHE["last_fetched"] > 3600:
+        try:
+            res = requests.get("https://nfs.faireconomy.media/ff_calendar_thisweek.json", timeout=10)
+            if res.status_code == 200:
+                _NEWS_CACHE["data"] = res.json()
+                _NEWS_CACHE["last_fetched"] = now
+            else:
+                logger.warning(f"Failed to fetch news calendar, status: {res.status_code}")
+        except Exception as e:
+            logger.error(f"News API error: {e}")
+            # If it fails, keep using old cache. Wait at least 5 mins before retrying.
+            _NEWS_CACHE["last_fetched"] = now - 3300 
+            
+    events = _NEWS_CACHE["data"]
+    if not events:
+        return False, "No news data", 0
+        
+    keywords = ["cpi", "nfp", "fomc", "interest rate", "rate decision", "ecb", "powell"]
+    
+    current_dt = datetime.now(timezone.utc)
+    
+    for ev in events:
+        country = ev.get("country", "")
+        impact = ev.get("impact", "")
+        title = ev.get("title", "").lower()
+        
+        if country in ["USD", "EUR"] and impact == "High":
+            # Check keywords
+            if any(k in title for k in keywords):
+                try:
+                    ev_time = pd.Timestamp(ev["date"])
+                    if ev_time.tzinfo is None:
+                        ev_time = ev_time.tz_localize("UTC")
+                    else:
+                        ev_time = ev_time.tz_convert("UTC")
+                    
+                    diff_minutes = (current_dt - ev_time).total_seconds() / 60.0
+                    
+                    # 15 mins before to 15 mins after
+                    if -15 <= diff_minutes <= 15:
+                        logger.warning(f"High impact news detected — trading paused ({ev['title']})")
+                        return True, f"High impact news: {ev['title']}", 100
+                except Exception as e:
+                    logger.error(f"Error parsing news date {ev.get('date')}: {e}")
+                    
+    return False, "No high impact news", 0
 
 def check_sideways_market(df):
     """Detect if the market is moving too sideways (lack of trend)."""
@@ -126,12 +192,54 @@ def check_wick_rejection(df, direction):
             
     return False, "No extreme rejection", 0
 
+def check_spread_safety(df):
+    """
+    Estimate spread/slippage using High-Low micro volatility.
+    """
+    if df is None or len(df) < 5:
+        return False, "Insufficient data", 0
+        
+    last = df.iloc[-1]
+    atr = last["ATR"]
+    current_spread = last["High"] - last["Low"]
+    
+    avg_spread = (df["High"] - df["Low"]).tail(5).mean()
+    
+    # Prevent trading during abnormal spread spikes
+    if current_spread > (avg_spread * 3.0) and current_spread > 0.00015:
+        return True, "Abnormal spread spike detected", 25
+        
+    # During dangerous volatility: increase spread sensitivity
+    atr_mean = df["ATR"].tail(50).mean()
+    is_volatile = atr > (atr_mean * 1.5)
+    
+    # Reject signals if spread too large
+    if is_volatile:
+        if current_spread > (atr * 2.0):
+            return True, "Spread too large during high volatility", 25
+    else:
+        if current_spread > (atr * 3.0) and current_spread > 0.0002:
+            return True, "Spread/Slippage risk too high", 20
+            
+    # Add spread penalty to confidence
+    if is_volatile and current_spread > (atr * 1.2):
+        return False, "High spread penalty (Volatile)", 15
+    elif current_spread > (atr * 1.5):
+        return False, "Spread penalty", 10
+        
+    return False, "Spread normal", 0
+
 def run_market_safety(df, direction):
     """
     Aggregate all safety checks.
     Returns (is_safe, message, total_penalty)
     """
     total_penalty = 0
+    
+    # 0. High Impact News Check (Immediate Reject)
+    is_news, news_msg, news_penalty = check_high_impact_news()
+    if is_news:
+        return False, news_msg, news_penalty
     
     # 1. Session Check
     is_dead, sess_msg, sess_penalty = check_market_session()
@@ -168,6 +276,12 @@ def run_market_safety(df, direction):
     if is_dead:
         return False, atr_msg, atr_penalty
     total_penalty += atr_penalty
+        
+    # 7. Spread/Slippage Safety
+    is_spread_high, spread_msg, spread_penalty = check_spread_safety(df)
+    if is_spread_high:
+        return False, spread_msg, spread_penalty
+    total_penalty += spread_penalty
         
     # Cap total combined penalty to 25 to avoid over-filtering
     total_penalty = min(total_penalty, 25)

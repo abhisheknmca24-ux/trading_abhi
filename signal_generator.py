@@ -7,6 +7,7 @@ import requests
 from datetime import datetime, timedelta
 from indicators import add_indicators
 from learning_engine import learning_engine
+from persistence import safe_load_json, safe_save_json
 
 # Configuration
 PAIR = "EURUSD"
@@ -213,13 +214,13 @@ def decide_direction_live(df: pd.DataFrame) -> tuple[str, int]:
     call_score = 0
     put_score = 0
 
-    # --- 1. EMA Trend (weight: 35) ---
+    # --- 1. EMA Trend (weight: 25) ---
     try:
         if not pd.isna(last["EMA50"]) and not pd.isna(last["EMA200"]):
             if last["EMA50"] > last["EMA200"]:
-                call_score += 35
+                call_score += 25
             else:
-                put_score += 35
+                put_score += 25
     except Exception:
         pass
 
@@ -475,21 +476,17 @@ def calculate_recurring_strength(df):
 
 def has_run_today():
     """Check if the generator already ran today."""
-    if not os.path.exists(STATE_FILE):
-        return False
     try:
-        with open(STATE_FILE, "r") as f:
-            state = json.load(f)
-            last_run = state.get("last_run_date")
-            return last_run == datetime.now().strftime("%Y-%m-%d")
+        state = safe_load_json(STATE_FILE, default={})
+        last_run = state.get("last_run_date")
+        return last_run == datetime.now().strftime("%Y-%m-%d")
     except Exception:
         return False
 
 
 def update_run_state():
     """Update the state file with today's date."""
-    with open(STATE_FILE, "w") as f:
-        json.dump({"last_run_date": datetime.now().strftime("%Y-%m-%d")}, f)
+    safe_save_json(STATE_FILE, {"last_run_date": datetime.now().strftime("%Y-%m-%d")})
 
 
 def generate_daily_signals():
@@ -517,8 +514,7 @@ def generate_daily_signals():
     signals = calculate_recurring_strength(df)
 
     if signals:
-        with open(SIGNAL_FILE, "w") as f:
-            json.dump(signals, f, indent=2)
+        safe_save_json(SIGNAL_FILE, signals)
         logger.info(f"Successfully generated {len(signals)} strong signals.")
         update_run_state()
         return True
@@ -597,14 +593,9 @@ def generate_forced_daily_signals(df: pd.DataFrame | None = None) -> list[dict]:
     forced_signals = [direct_signal, martingale_signal]
 
     # 4. Merge with existing signals in generated_signals.json
-    existing: list[dict] = []
-    if os.path.exists(SIGNAL_FILE):
-        try:
-            with open(SIGNAL_FILE, "r") as f:
-                existing = json.load(f)
-        except Exception as e:
-            logger.error(f"Could not read existing signals: {e}")
-            existing = []
+    existing = safe_load_json(SIGNAL_FILE, default=[])
+    if not isinstance(existing, list):
+        existing = []
 
     # Remove any previous forced signals at the same times so we always
     # regenerate them fresh (never skip due to stale cache)
@@ -629,8 +620,7 @@ def generate_forced_daily_signals(df: pd.DataFrame | None = None) -> list[dict]:
     merged.sort(key=lambda x: x.get("time", ""))
 
     try:
-        with open(SIGNAL_FILE, "w") as f:
-            json.dump(merged, f, indent=2)
+        safe_save_json(SIGNAL_FILE, merged)
         logger.info(
             f"Forced signals saved: {direction} @ {FORCE_DIRECT_TIME} (direct) "
             f"& {FORCE_MARTINGALE_TIME} (martingale) | confidence={confidence}%"

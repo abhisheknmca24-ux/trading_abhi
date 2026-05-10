@@ -5,13 +5,16 @@ from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 import json
 import os
+import traceback
 import re
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Dict
+from cache_manager import cache
 
 import pandas as pd
 
 from indicators import add_indicators
-from market_safety import run_market_safety
+from persistence import safe_load_json, safe_save_json
+from market_safety import run_market_safety, check_high_impact_news, check_dangerous_volatility, check_atr_floor
 from confirmation_engine import validate_live_signal
 from signal_generator import decide_direction_live
 from learning_engine import learning_engine
@@ -38,7 +41,7 @@ SIGNAL_PATTERN = re.compile(r"^(?P<hour>\d{2}):(?P<minute>\d{2})\s+EURUSD\s+(?P<
 FORCED_DIRECT_TIME = "15:05"
 FORCED_MARTINGALE_TIME = "15:10"
 FORCED_SIGNAL_LOW_CONF_THRESHOLD = 55  # Below this → LOW CONFIDENCE warning
-FORCED_MARTINGALE_MIN_CONFIDENCE = 70  # Below this → HIGH RISK MARTINGALE warning
+FORCED_MARTINGALE_MIN_CONFIDENCE = 75  # Below this → HIGH RISK MARTINGALE warning
 
 
 @dataclass(frozen=True)
@@ -77,33 +80,33 @@ class SmartSignalManager:
         self.forced_overlap_times: List[datetime] = []
 
     def load(self):
-        if not os.path.exists(self.storage_file):
-            return
         try:
-            with open(self.storage_file, "r") as f:
-                data = json.load(f)
-                self.tracked_trades = data.get("tracked_trades", [])
-                for t in self.tracked_trades:
-                    if "signal_time" in t and isinstance(t["signal_time"], str):
-                        t["signal_time"] = datetime.fromisoformat(t["signal_time"])
-                    if "expiry_time" in t and isinstance(t["expiry_time"], str):
-                        t["expiry_time"] = datetime.fromisoformat(t["expiry_time"])
+            data = safe_load_json(self.storage_file, default={})
+            if not data:
+                return
                 
-                self.last_daily_report_date = data.get("last_daily_report_date")
-                if self.last_daily_report_date:
-                    self.last_daily_report_date = date.fromisoformat(self.last_daily_report_date)
-                
-                self.processed_signals = set(data.get("processed_signals", []))
+            self.tracked_trades = data.get("tracked_trades", [])
+            for t in self.tracked_trades:
+                if "signal_time" in t and isinstance(t["signal_time"], str):
+                    t["signal_time"] = datetime.fromisoformat(t["signal_time"])
+                if "expiry_time" in t and isinstance(t["expiry_time"], str):
+                    t["expiry_time"] = datetime.fromisoformat(t["expiry_time"])
+            
+            self.last_daily_report_date = data.get("last_daily_report_date")
+            if self.last_daily_report_date:
+                self.last_daily_report_date = date.fromisoformat(self.last_daily_report_date)
+            
+            self.processed_signals = set(data.get("processed_signals", []))
 
-                raw_lctt = data.get("last_confirmed_trade_time")
-                if raw_lctt:
-                    try:
-                        self.last_confirmed_trade_time = datetime.fromisoformat(raw_lctt)
-                    except Exception:
-                        self.last_confirmed_trade_time = None
-                
-                self.recalculate_stats()
-                logger.info(f"Loaded {len(self.tracked_trades)} trades from {self.storage_file}")
+            raw_lctt = data.get("last_confirmed_trade_time")
+            if raw_lctt:
+                try:
+                    self.last_confirmed_trade_time = datetime.fromisoformat(raw_lctt)
+                except Exception:
+                    self.last_confirmed_trade_time = None
+            
+            self.recalculate_stats()
+            logger.info(f"Loaded {len(self.tracked_trades)} trades from {self.storage_file}")
         except Exception as e:
             logger.error(f"Error loading {self.storage_file}: {e}")
 
@@ -123,8 +126,7 @@ class SmartSignalManager:
                     entry["expiry_time"] = entry["expiry_time"].isoformat()
                 data["tracked_trades"].append(entry)
             
-            with open(self.storage_file, "w") as f:
-                json.dump(data, f, indent=2)
+            safe_save_json(self.storage_file, data)
         except Exception as e:
             logger.error(f"Error saving {self.storage_file}: {e}")
 
@@ -296,17 +298,11 @@ def load_signal_entries(signal_lines: List[str], current_day: Optional[date] = N
 def load_generated_signals() -> List[SignalEntry]:
     """Load generated_signals.json and convert to SignalEntry list."""
     try:
-        if not os.path.exists(GENERATED_SIGNALS_FILE):
-            return []
-        with open(GENERATED_SIGNALS_FILE) as f:
-            content = f.read().strip()
-            if not content:
-                return []
-            generated = json.loads(content)
+        generated = safe_load_json(GENERATED_SIGNALS_FILE, default=[])
         if not isinstance(generated, list):
             return []
     except Exception as e:
-        print(f"Error loading generated signals: {e}")
+        logger.error(f"Error loading generated signals: {e}")
         return []
 
     tz = _get_timezone()
@@ -555,16 +551,27 @@ def validate_martingale_signal(df: pd.DataFrame, direction: str) -> bool:
 
 
 def calculate_confidence(df: pd.DataFrame, direction: str) -> int:
+    if df is None or len(df) < 3:
+        return 0
+
     last = df.iloc[-1]
     prev = df.iloc[-2]
+    prev2 = df.iloc[-3]
+
     atr = float(last["ATR"]) if not pd.isna(last.get("ATR")) else 0.0
-    atr_mean = float(df["ATR"].mean()) if not pd.isna(df["ATR"].mean()) else 0.0
+    atr_mean = float(df["ATR"].tail(50).mean()) if not pd.isna(df["ATR"].mean()) else 0.0
+
     candle_size = abs(float(last["Close"]) - float(last["Open"]))
+    prev_candle_size = abs(float(prev["Close"]) - float(prev["Open"]))
     avg_candle = float((df["Close"] - df["Open"]).abs().tail(10).mean())
+
     distance = abs(float(last["Close"]) - float(last["EMA50"]))
+    ema_separation = abs(float(last["EMA50"]) - float(last["EMA200"]))
+    ema_separation_mean = abs(df["EMA50"] - df["EMA200"]).tail(20).mean()
 
     score = 0
-    # EMA Trend: +25
+
+    # 1. EMA Trend: 25
     if direction == "CALL":
         if last["EMA50"] > last["EMA200"]:
             score += 25
@@ -572,33 +579,72 @@ def calculate_confidence(df: pd.DataFrame, direction: str) -> int:
         if last["EMA50"] < last["EMA200"]:
             score += 25
 
-    # RSI Movement: +15
+    # 2. RSI Momentum: 25
+    rsi_now = float(last["RSI"])
+    rsi_prev = float(prev["RSI"])
+    rsi_prev2 = float(prev2["RSI"])
+    
+    rsi_strong = False
     if direction == "CALL":
-        rsi = float(last["RSI"])
-        rsi_prev = float(prev["RSI"])
-        if rsi > 55 and rsi > rsi_prev:
+        if rsi_now > 52 and rsi_now > rsi_prev:
             score += 15
+            # RSI acceleration
+            if (rsi_now - rsi_prev) > (rsi_prev - rsi_prev2) and (rsi_now - rsi_prev) > 1.0:
+                score += 10
+                rsi_strong = True
     else:
-        rsi = float(last["RSI"])
-        rsi_prev = float(prev["RSI"])
-        if rsi < 45 and rsi < rsi_prev:
+        if rsi_now < 48 and rsi_now < rsi_prev:
             score += 15
+            # RSI acceleration
+            if (rsi_prev - rsi_now) > (rsi_prev2 - rsi_prev) and (rsi_prev - rsi_now) > 1.0:
+                score += 10
+                rsi_strong = True
 
-    # ATR Strength: +15
+    # 3. ATR Strength: 20
     if atr > atr_mean:
-        score += 15
+        score += 10
+        if atr > (atr_mean * 1.2):
+            score += 10
 
-    # Candle Strength: +10
+    # 4. Candle Momentum: 20
+    candle_strong = False
     if candle_size > avg_candle:
         score += 10
+        if direction == "CALL" and last["Close"] > last["Open"] and prev["Close"] > prev["Open"]:
+            if candle_size >= prev_candle_size:
+                score += 10
+                candle_strong = True
+        elif direction == "PUT" and last["Close"] < last["Open"] and prev["Close"] < prev["Open"]:
+            if candle_size >= prev_candle_size:
+                score += 10
+                candle_strong = True
 
-    # Distance: +10 (if close to EMA50)
+    # 5. EMA Position: 10
     if distance <= max(0.0003, atr * 0.50):
         score += 10
 
-    # Score now maxes at 75 based on weights above; scale to percentage and cap at 90%
-    confidence = int((score / 75) * 85)
-    return min(confidence, 90)
+    # Confidence Penalties
+    penalties = 0
+    if candle_size < (avg_candle * 0.5):
+        penalties += 10
+    if atr < (atr_mean * 0.8):
+        penalties += 10
+    if abs(rsi_now - rsi_prev) < 0.5:
+        penalties += 15
+    if ema_separation < (ema_separation_mean * 0.8):
+        penalties += 10
+    if atr < (atr_mean * 0.6):
+        penalties += 30  # Decay during sideways
+
+    confidence = score - penalties
+    
+    # Cap at 80 unless all strong conditions are met
+    ema_strong = ema_separation > ema_separation_mean
+    if confidence > 80:
+        if not (atr > atr_mean and rsi_strong and candle_strong and ema_strong):
+            confidence = 80
+
+    return max(0, min(confidence, 100))
 
 
 def build_forex_targets(df: pd.DataFrame, direction: str, confidence: int) -> tuple[float, float, float]:
@@ -856,8 +902,8 @@ def _check_safety_rules(df: pd.DataFrame, direction: str, confidence: int) -> tu
     if direction == "PUT" and rsi_value < 40: penalties += 10
     
     confidence -= penalties
-    if confidence < 70:
-        return False, f"Confidence dropped below 70 after penalties (-{penalties})", confidence
+    if confidence < 68:
+        return False, f"Confidence dropped below 68 after penalties (-{penalties})", confidence
 
     return True, "Safety passed", confidence
 
@@ -1003,6 +1049,7 @@ def store_tracked_signal(
     confidence: float,
     df: pd.DataFrame,
     source: str = "telegram",
+    overlapped_forced: bool = False,
 ) -> None:
     last = df.iloc[-1]
     manager.tracked_trades.append({
@@ -1018,6 +1065,7 @@ def store_tracked_signal(
         "atr": float(last["ATR"]) if not pd.isna(last["ATR"]) else None,
         "ema_trend": _get_ema_trend(df, direction),
         "resolved": False,
+        "overlapped_forced": overlapped_forced,
     })
 
     # Memory management: keep only last 200 trades
@@ -1345,6 +1393,9 @@ def _process_forced_signals(
                 continue
 
             is_martingale = signal.get("forced_type") == "martingale"
+            if signal.get("is_blocked"):
+                continue
+
             # Use a dedup key that cannot collide with regular signals
             forced_key = f"forced_{signal_time:%H:%M}_{'MG' if is_martingale else 'DIR'}"
 
@@ -1359,11 +1410,28 @@ def _process_forced_signals(
             # ── PRE-SIGNAL (60-120 s before entry) ───────────────────────
             seconds_to_entry = (signal_time - now).total_seconds()
             if PRE_SIGNAL_MIN_SECONDS <= seconds_to_entry <= PRE_SIGNAL_MAX_SECONDS and not signal.get("pre_sent"):
-                # Re-calculate live direction for the pre-signal message
                 live_dir, live_conf = decide_direction_live(work_df)
+                
+                block_reason = None
                 if live_dir is None:
-                    logger.warning("Forced signal skipped due to missing live direction.")
+                    block_reason = "Missing live direction data"
+                else:
+                    # ── FORCED_HARD_BLOCK CHECK ──
+                    is_news, news_msg, _ = check_high_impact_news()
+                    is_dead, atr_msg, _ = check_atr_floor(work_df)
+                    
+                    if is_news:
+                        block_reason = news_msg
+                    elif is_dead:
+                        block_reason = atr_msg
+
+                if block_reason:
+                    logger.warning(f"[FORCED] Signal blocked: {block_reason}")
+                    msg = f"⚠️ <b>Forced signal blocked due to dangerous market conditions</b>\nReason: {block_reason}"
+                    messages.append(msg)
+                    signal["is_blocked"] = True
                     continue
+
                 signal["direction"] = live_dir
                 signal["stored_confidence"] = live_conf
                 low_confidence = live_conf < FORCED_SIGNAL_LOW_CONF_THRESHOLD
@@ -1378,9 +1446,11 @@ def _process_forced_signals(
             # ── CONFIRMATION (within SIGNAL_WINDOW_SECONDS of entry) ──────
             if abs(seconds_to_entry) <= SIGNAL_WINDOW_SECONDS and not signal.get("confirmed_sent"):
                 # --- Global trade lock check (forced signals may bypass) ---
+                is_overlapped = False
                 if manager.last_confirmed_trade_time is not None:
                     elapsed = (now - manager.last_confirmed_trade_time).total_seconds()
                     if elapsed < TRADE_LOCK_SECONDS:
+                        is_overlapped = True
                         _log_forced_overlap(
                             now=now,
                             forced_signal_time=signal_time,
@@ -1389,11 +1459,29 @@ def _process_forced_signals(
                         )
                         # Forced signals bypass the lock — log but do NOT skip
 
-                # Re-check direction live – may flip from original
                 live_dir, live_conf = decide_direction_live(work_df)
+                
+                block_reason = None
                 if live_dir is None:
-                    logger.warning("Forced signal skipped due to missing live direction.")
+                    block_reason = "Missing live direction data"
+                else:
+                    # ── FORCED_HARD_BLOCK CHECK (again at confirmation) ──
+                    is_news, news_msg, _ = check_high_impact_news()
+                    is_dead, atr_msg, _ = check_atr_floor(work_df)
+                    
+                    if is_news:
+                        block_reason = news_msg
+                    elif is_dead:
+                        block_reason = atr_msg
+
+                if block_reason:
+                    logger.warning(f"[FORCED] Confirmation blocked: {block_reason}")
+                    if not signal.get("is_blocked"):
+                        msg = f"⚠️ <b>Forced signal blocked due to dangerous market conditions</b>\nReason: {block_reason}"
+                        messages.append(msg)
+                    signal["is_blocked"] = True
                     continue
+
                 direction_flipped = live_dir != signal["direction"]
                 if direction_flipped:
                     logger.info(f"[FORCED] Direction flipped {signal['direction']} → {live_dir} at confirmation")
@@ -1436,6 +1524,7 @@ def _process_forced_signals(
                         confidence=live_conf,
                         df=conf_df,
                         source="forced",
+                        overlapped_forced=is_overlapped,
                     )
                 except Exception as te:
                     logger.error(f"[FORCED] store_tracked_signal error: {te}")
@@ -1505,9 +1594,28 @@ def process_signal_list(
                     final_data = df
 
                 try:
-                    final_price = float(final_data.iloc[-1]["Close"])
-                except:
-                    final_price = float(df.iloc[-1]["Close"])
+                    if "CandleTime" in final_data.columns:
+                        times_naive = pd.to_datetime(final_data["CandleTime"]).dt.tz_localize(None)
+                        exp_naive = pd.to_datetime(expiry).tz_localize(None)
+                        
+                        time_diffs = (times_naive - exp_naive).abs()
+                        closest_idx = time_diffs.idxmin()
+                        diff_sec = time_diffs.loc[closest_idx].total_seconds()
+                        
+                        if diff_sec <= 10:
+                            final_price = float(final_data.loc[closest_idx]["Close"])
+                            logger.debug(f"Expiry candle selected: {final_data.loc[closest_idx]['CandleTime']} for expiry {expiry} (diff: {diff_sec}s)")
+                        else:
+                            logger.warning(f"Stale expiry candle ({diff_sec}s off). Fallback to last.")
+                            final_price = float(final_data.iloc[-1]["Close"])
+                    else:
+                        final_price = float(final_data.iloc[-1]["Close"])
+                except Exception as e:
+                    logger.error(f"Error selecting expiry candle: {e}")
+                    try:
+                        final_price = float(final_data.iloc[-1]["Close"])
+                    except:
+                        final_price = float(df.iloc[-1]["Close"])
                 entry_price = float(entry.get("entry_price"))
                 direction = entry.get("direction")
 

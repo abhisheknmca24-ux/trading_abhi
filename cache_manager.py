@@ -47,17 +47,17 @@ class CacheManager:
         if interval == "1min":
             if self.cached_minute_df is not None and self.cached_minute_time == current_candle_key:
                 logger.debug(f"Cache HIT for 1min | Key: {current_candle_key}")
-                return self.cached_minute_df
+                return self.cached_minute_df.copy(deep=True)
             else:
                 logger.debug(f"Cache MISS for 1min | Key: {current_candle_key} | Refreshing from API")
                 df = fetch_func(interval)
                 if df is not None:
-                    self.cached_minute_df = df
+                    self.cached_minute_df = df.copy(deep=True)
                     self.cached_minute_time = current_candle_key
                     # Reset only 1min processed cache
                     logger.debug("Resetting processed 1min cache due to fresh candle data")
                     self.processed_1min_df = None
-                return df
+                return df.copy(deep=True) if df is not None else None
                 
         else:
             if (
@@ -66,18 +66,18 @@ class CacheManager:
                 and self.cached_candle_key == current_candle_key
             ):
                 logger.debug(f"Cache HIT for {interval} | Key: {current_candle_key}")
-                return self.cached_df
+                return self.cached_df.copy(deep=True)
             else:
                 logger.debug(f"Cache MISS for {interval} | Key: {current_candle_key} | Refreshing from API")
                 df = fetch_func(interval)
                 if df is not None:
                     self.cached_interval = interval
                     self.cached_candle_key = current_candle_key
-                    self.cached_df = df
+                    self.cached_df = df.copy(deep=True)
                     # Reset only 5min processed cache
                     logger.debug(f"Resetting processed {interval} cache due to fresh candle data")
                     self.processed_5min_df = None
-                return df
+                return df.copy(deep=True) if df is not None else None
 
     def get_processed_dataframe(self, interval, fetch_func, process_func):
         df = self.get_dataframe(interval, fetch_func)
@@ -87,16 +87,17 @@ class CacheManager:
         if interval == "1min":
             if self.processed_1min_df is not None:
                 logger.debug("Processed cache HIT for 1min")
-                return self.processed_1min_df
-            # Indicators are safe to add in-place; removing .copy() to save RAM
-            self.processed_1min_df = process_func(df)
-            return self.processed_1min_df
+                return self.processed_1min_df.copy(deep=True)
+            # Use deep copy to protect raw cache
+            self.processed_1min_df = process_func(df.copy(deep=True))
+            return self.processed_1min_df.copy(deep=True)
         else:
             if self.processed_5min_df is not None:
                 logger.debug(f"Processed cache HIT for {interval}")
-                return self.processed_5min_df
-            # Indicators are safe to add in-place; removing .copy() to save RAM
-            self.processed_5min_df = process_func(df)
-            return self.processed_5min_df
+                return self.processed_5min_df.copy(deep=True)
+            # Use deep copy to protect raw cache
+            self.processed_5min_df = process_func(df.copy(deep=True))
+            return self.processed_5min_df.copy(deep=True)
 
 cache = CacheManager()
+
