@@ -365,6 +365,72 @@ def _merge_generated_into_manager() -> None:
         manager.active_signals.extend(_build_signal_state(new_entries, source="generated"))
 
 
+def _inject_forced_signals_into_manager(now: Optional[datetime] = None) -> None:
+    """
+    Ensure the two compulsory daily signals (15:05 direct and 15:10 martingale)
+    are always present in manager.active_signals with ``is_forced=True``.
+
+    These are injected independently of the Telegram / generated signal files so
+    they can never be accidentally omitted.  The normal processing loop skips
+    them (via the ``is_forced`` guard), and ``_process_forced_signals()`` handles
+    their PRE + CONFIRMATION messages without any confidence / RSI / momentum
+    gating.
+    """
+    if now is None:
+        now = _now()
+
+    today = now.date()
+    tz = _get_timezone()
+
+    forced_specs = [
+        (FORCED_DIRECT_TIME,     "direct"),
+        (FORCED_MARTINGALE_TIME, "martingale"),
+    ]
+
+    for time_str, forced_type in forced_specs:
+        try:
+            h, m = map(int, time_str.split(":"))
+            signal_time = datetime.combine(today, time(h, m))
+            if tz is not None:
+                signal_time = signal_time.replace(tzinfo=tz)
+
+            # Dedup: skip if a forced entry for this slot already exists
+            already_present = any(
+                sig.get("is_forced")
+                and sig.get("forced_type") == forced_type
+                and sig["time"].date() == today
+                for sig in manager.active_signals
+            )
+            if already_present:
+                continue
+
+            forced_state = {
+                "time": signal_time,
+                "pair": "EURUSD",
+                # Direction will be decided live by _process_forced_signals;
+                # use a neutral placeholder so the slot is populated.
+                "direction": "CALL",
+                "source": "forced",
+                "pre_sent": False,
+                "confirmed_sent": False,
+                "martingale_time": signal_time + MARTINGALE_ENTRY_DELAY,
+                "martingale_prealert_sent": False,
+                "martingale_confirmed_sent": False,
+                "martingale_confidence": 0,
+                "raw_line": f"{time_str} EURUSD FORCED",
+                # Forced-signal extras
+                "is_forced": True,
+                "forced_type": forced_type,
+                "low_confidence": False,
+                "stored_confidence": 0,
+                "is_blocked": False,
+            }
+            manager.active_signals.append(forced_state)
+            logger.debug(f"[FORCED] Injected {forced_type} signal slot at {time_str}")
+        except Exception as e:
+            logger.error(f"[FORCED] Injection error for {time_str}: {e}")
+
+
 
 
 def _merge_states(primary: List[dict], secondary: List[dict]) -> List[dict]:
@@ -406,6 +472,7 @@ def update_signal_list(signal_lines: Optional[List[str]] = None, now: Optional[d
     if signal_lines is None:
         manager.last_signal_update_time = now
         _merge_generated_into_manager()
+        _inject_forced_signals_into_manager(now)
         return manager.active_signals
 
     if isinstance(signal_lines, str):
@@ -422,6 +489,7 @@ def update_signal_list(signal_lines: Optional[List[str]] = None, now: Optional[d
         manager.confirmed_signal_count = 0
         manager.last_signal_update_time = now
         _merge_generated_into_manager()
+        _inject_forced_signals_into_manager(now)
         return manager.active_signals
 
     update_id = f"mem-{current_day.isoformat()}-{len(signal_lines)}-{'|'.join(signal_lines)}"
@@ -436,6 +504,7 @@ def update_signal_list(signal_lines: Optional[List[str]] = None, now: Optional[d
         print("Signal list updated")
 
     _merge_generated_into_manager()
+    _inject_forced_signals_into_manager(now)
     manager.last_signal_update_time = now
     return manager.active_signals
 
@@ -1659,6 +1728,12 @@ def process_signal_list(
 
     for signal in manager.active_signals:
         try:
+            # Forced signals (15:05 / 15:10) are handled exclusively by
+            # _process_forced_signals() above.  Skip them here to prevent
+            # confidence / RSI / momentum filters from rejecting them.
+            if signal.get("is_forced"):
+                continue
+
             signal_time = signal["time"]
             direction = signal["direction"]
 
