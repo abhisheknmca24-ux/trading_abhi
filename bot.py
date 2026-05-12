@@ -1,4 +1,5 @@
 from logger import logger
+import json
 import os
 import time
 from datetime import time as clock_time
@@ -226,6 +227,72 @@ def send_telegram(msg):
     logger.error("Telegram delivery failed after retries")
 
 
+# ==============================
+# DAILY SIGNAL LIST SENDER
+# ==============================
+
+_daily_signal_list_sent_date = None   # tracks which calendar date the list was sent
+
+GENERATED_SIGNALS_PATH = os.path.join(os.path.dirname(__file__), "generated_signals.json")
+DAILY_SEND_HOUR = 10    # 10:00 AM IST
+DAILY_SEND_MINUTE = 0
+
+
+def maybe_send_daily_signal_list():
+    """
+    Send the full generated_signals.json list to Telegram once per day at 10:00 AM IST.
+    Skips if the list is empty or already sent today.
+    """
+    global _daily_signal_list_sent_date
+
+    now = pd.Timestamp.now(tz="Asia/Kolkata")
+    today = now.date()
+
+    # Reset guard if it's a new day
+    if _daily_signal_list_sent_date is not None and _daily_signal_list_sent_date != today:
+        _daily_signal_list_sent_date = None
+
+    # Already sent today — skip
+    if _daily_signal_list_sent_date == today:
+        return
+
+    # Only send at / after 10:00 AM
+    if now.hour < DAILY_SEND_HOUR or (now.hour == DAILY_SEND_HOUR and now.minute < DAILY_SEND_MINUTE):
+        return
+
+    # Load signal list
+    try:
+        with open(GENERATED_SIGNALS_PATH, "r") as f:
+            signals = json.load(f)
+    except FileNotFoundError:
+        logger.warning("generated_signals.json not found — skipping daily send")
+        _daily_signal_list_sent_date = today  # don't retry until tomorrow
+        return
+    except Exception as e:
+        logger.error(f"Failed to read generated_signals.json: {e}")
+        return
+
+    # Skip if empty
+    if not signals:
+        logger.info("Daily signal list is empty — skipping send")
+        _daily_signal_list_sent_date = today
+        return
+
+    # Format message
+    lines = ["\U0001f4ca *TODAY GENERATED SIGNALS*\n"]
+    for sig in signals:
+        t = sig.get("time", "??:??")
+        pair = sig.get("pair", "EURUSD")
+        direction = sig.get("direction", "?")
+        lines.append(f"{t} {pair} {direction}")
+
+    message = "\n".join(lines)
+
+    logger.info("Sending daily signal list to Telegram")
+    send_telegram(message)
+    _daily_signal_list_sent_date = today
+
+
 def fetch_signal_text_from_telegram():
     global LAST_SIGNAL_INPUT_UPDATE_ID
 
@@ -362,6 +429,9 @@ def run():
 
     while True:
         try:
+            # 0) Send daily signal list at 10:00 AM (once per day).
+            maybe_send_daily_signal_list()
+
             # 1) Update external signal list first.
             message_text = fetch_signal_text_from_telegram()
             if message_text:
