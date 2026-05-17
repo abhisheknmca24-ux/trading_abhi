@@ -240,15 +240,18 @@ DAILY_SEND_MINUTE = 0
 
 def maybe_send_daily_signal_list():
     """
-    Send the full generated_signals.json list to Telegram once per day at 10:00 AM IST.
-    Skips if the list is empty or already sent today.
+    Send generated_signals.json to Telegram once per day at 10:00 AM IST.
+    Sends TWO separate messages:
+      Message 1 — CALL signals (skipped if empty)
+      Message 2 — PUT signals  (skipped if empty)
+    Prevents duplicates with a per-day lock that resets at midnight.
     """
     global _daily_signal_list_sent_date
 
     now = pd.Timestamp.now(tz="Asia/Kolkata")
     today = now.date()
 
-    # Reset guard if it's a new day
+    # Reset guard on new calendar day
     if _daily_signal_list_sent_date is not None and _daily_signal_list_sent_date != today:
         _daily_signal_list_sent_date = None
 
@@ -256,7 +259,7 @@ def maybe_send_daily_signal_list():
     if _daily_signal_list_sent_date == today:
         return
 
-    # Only send at / after 10:00 AM
+    # Only send at / after 10:00 AM IST
     if now.hour < DAILY_SEND_HOUR or (now.hour == DAILY_SEND_HOUR and now.minute < DAILY_SEND_MINUTE):
         return
 
@@ -266,30 +269,54 @@ def maybe_send_daily_signal_list():
             signals = json.load(f)
     except FileNotFoundError:
         logger.warning("generated_signals.json not found — skipping daily send")
-        _daily_signal_list_sent_date = today  # don't retry until tomorrow
+        _daily_signal_list_sent_date = today
         return
     except Exception as e:
         logger.error(f"Failed to read generated_signals.json: {e}")
         return
 
-    # Skip if empty
     if not signals:
         logger.info("Daily signal list is empty — skipping send")
         _daily_signal_list_sent_date = today
         return
 
-    # Format message
-    lines = ["\U0001f4ca *TODAY GENERATED SIGNALS*\n"]
-    for sig in signals:
-        t = sig.get("time", "??:??")
-        pair = sig.get("pair", "EURUSD")
-        direction = sig.get("direction", "?")
-        lines.append(f"{t} {pair} {direction}")
+    # Separate CALL and PUT (exclude forced martingale duplicates in display)
+    call_sigs = [s for s in signals if s.get("direction") == "CALL"]
+    put_sigs  = [s for s in signals if s.get("direction") == "PUT"]
 
-    message = "\n".join(lines)
+    def _fmt_signal(s: dict) -> str:
+        t    = s.get("time", "??:??")
+        pair = s.get("pair", "EURUSD")
+        ps   = s.get("pattern_strength")
+        hsr  = s.get("historical_success_rate")
+        line = f"{t} {pair}"
+        if ps is not None:
+            line += f"\nPattern Strength: {ps}"
+        if hsr is not None:
+            line += f"\nHistorical Success: {hsr}%"
+        return line
 
-    logger.info("Sending daily signal list to Telegram")
-    send_telegram(message)
+    sent_any = False
+
+    if call_sigs:
+        lines = ["\U0001f4ca *TODAY GENERATED CALL SIGNALS*\n"]
+        for s in sorted(call_sigs, key=lambda x: x.get("time", "")):
+            lines.append(_fmt_signal(s))
+        logger.info(f"Sending {len(call_sigs)} CALL signals to Telegram")
+        send_telegram("\n\n".join(lines))
+        sent_any = True
+
+    if put_sigs:
+        lines = ["\U0001f4ca *TODAY GENERATED PUT SIGNALS*\n"]
+        for s in sorted(put_sigs, key=lambda x: x.get("time", "")):
+            lines.append(_fmt_signal(s))
+        logger.info(f"Sending {len(put_sigs)} PUT signals to Telegram")
+        send_telegram("\n\n".join(lines))
+        sent_any = True
+
+    if not sent_any:
+        logger.info("No CALL or PUT signals to send today.")
+
     _daily_signal_list_sent_date = today
 
 

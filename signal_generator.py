@@ -8,8 +8,9 @@ from datetime import datetime, timedelta
 from indicators import add_indicators
 from learning_engine import learning_engine
 from persistence import safe_load_json, safe_save_json
+from signal_manager import timing_db
 
-# Configuration
+# ── Configuration ─────────────────────────────────────────
 PAIR = "EURUSD"
 SYMBOL = "EUR/USD"
 INTERVAL = "5min"
@@ -17,12 +18,16 @@ SIGNAL_FILE = "generated_signals.json"
 STATE_FILE = ".generator_state.json"
 DF_CACHE_FILE = ".df_cache.pkl"
 
-# Force daily signal times (IST)
 FORCE_DIRECT_TIME = "15:05"
 FORCE_MARTINGALE_TIME = "15:10"
-FORCE_SIGNAL_CONFIDENCE_THRESHOLD = 55  # Below this → LOW CONFIDENCE warning
+FORCE_SIGNAL_CONFIDENCE_THRESHOLD = 55
 
-# Load TD_API_KEY
+# Pattern engine thresholds
+MIN_SLOT_OCCURRENCES = 7        # minimum candles per time slot across 14 days
+BASE_CONFIDENCE_THRESHOLD = 68  # minimum composite score to qualify
+PATTERN_STRENGTH_THRESHOLD = 55 # minimum pattern strength from timing_db
+
+# Load API key
 if os.getenv("RAILWAY_ENVIRONMENT"):
     from config_prod import TD_API_KEY
 else:
@@ -31,45 +36,31 @@ else:
     except ImportError:
         TD_API_KEY = os.getenv("TD_API_KEY")
 
-# ──────────────────────────────────────────────────────────────
-# DataFrame cache (fallback when API unavailable)
-# ──────────────────────────────────────────────────────────────
+# ── DataFrame cache ───────────────────────────────────────
 _df_memory_cache: pd.DataFrame | None = None
-_df_memory_cache_time: datetime | None = None   # UTC wall-clock time of last save
-
-# Maximum age of a cached DataFrame before it is considered stale
-_DF_CACHE_MAX_AGE_SECONDS = 30 * 60  # 30 minutes
+_df_memory_cache_time: datetime | None = None
+_DF_CACHE_MAX_AGE_SECONDS = 30 * 60
 
 
 def _save_df_cache(df: pd.DataFrame) -> None:
-    """Persist DataFrame to disk so next API failure can use it."""
     global _df_memory_cache, _df_memory_cache_time
     _df_memory_cache = df
     _df_memory_cache_time = datetime.utcnow()
     try:
         df.to_pickle(DF_CACHE_FILE)
-        # Persist cache timestamp alongside the pickle so disk reloads can
-        # also check freshness after a process restart.
-        _ts_file = DF_CACHE_FILE + ".ts"
-        with open(_ts_file, "w") as f:
+        with open(DF_CACHE_FILE + ".ts", "w") as f:
             f.write(_df_memory_cache_time.isoformat())
     except Exception as e:
         logger.warning(f"DF cache save failed: {e}")
 
 
 def _get_df_cache_age_seconds() -> float | None:
-    """Return age of the in-memory cache in seconds, or None if not set."""
     if _df_memory_cache_time is None:
         return None
     return (datetime.utcnow() - _df_memory_cache_time).total_seconds()
 
 
 def is_df_cache_fresh() -> bool:
-    """
-    Return True if the in-memory DataFrame cache is present AND was
-    saved within the last 30 minutes.  Always returns False when no
-    cache exists, so callers must handle a fresh-API path.
-    """
     age = _get_df_cache_age_seconds()
     if age is None:
         return False
@@ -77,37 +68,25 @@ def is_df_cache_fresh() -> bool:
 
 
 def _load_df_cache() -> pd.DataFrame | None:
-    """
-    Load the latest cached DataFrame (memory first, then disk).
-    Rejects caches older than 30 minutes to prevent stale-data trading.
-    """
     global _df_memory_cache, _df_memory_cache_time
     if _df_memory_cache is not None:
         if is_df_cache_fresh():
             return _df_memory_cache
         logger.warning("Cached market data too old (>30 min) — rejecting in-memory cache.")
-        # Don't clear the object; the freshness gate is the guard.
 
     if os.path.exists(DF_CACHE_FILE):
         try:
-            # Check the timestamp file before bothering to unpickle
             _ts_file = DF_CACHE_FILE + ".ts"
             if os.path.exists(_ts_file):
-                with open(_ts_file, "r") as f:
+                with open(_ts_file) as f:
                     saved_at = datetime.fromisoformat(f.read().strip())
                 age_sec = (datetime.utcnow() - saved_at).total_seconds()
                 if age_sec > _DF_CACHE_MAX_AGE_SECONDS:
-                    logger.warning(
-                        f"Cached market data too old ({int(age_sec // 60)}m) — "
-                        "rejecting disk cache."
-                    )
+                    logger.warning(f"Disk cache too old ({int(age_sec//60)}m) — rejecting.")
                     return None
             df = pd.read_pickle(DF_CACHE_FILE)
             _df_memory_cache = df
-            if os.path.exists(_ts_file):
-                _df_memory_cache_time = saved_at  # type: ignore[possibly-undefined]
-            else:
-                _df_memory_cache_time = datetime.utcnow()  # treat as fresh for this session
+            _df_memory_cache_time = saved_at if os.path.exists(_ts_file) else datetime.utcnow()
             logger.info("Loaded DataFrame from disk cache.")
             return df
         except Exception as e:
@@ -115,25 +94,14 @@ def _load_df_cache() -> pd.DataFrame | None:
     return None
 
 
-# ──────────────────────────────────────────────────────────────
-# Data fetching
-# ──────────────────────────────────────────────────────────────
-
+# ── Data fetching ─────────────────────────────────────────
 def get_historical_data(outputsize=4500) -> pd.DataFrame | None:
-    """Fetch 10-14 days of 5-minute candles from TwelveData.
-    Falls back to the latest cached DataFrame on API failure.
-    """
     if not TD_API_KEY:
-        logger.error("Error: TD_API_KEY not found.")
+        logger.error("TD_API_KEY not found.")
         return _load_df_cache()
 
     url = "https://api.twelvedata.com/time_series"
-    params = {
-        "symbol": SYMBOL,
-        "interval": INTERVAL,
-        "apikey": TD_API_KEY,
-        "outputsize": outputsize
-    }
+    params = {"symbol": SYMBOL, "interval": INTERVAL, "apikey": TD_API_KEY, "outputsize": outputsize}
 
     try:
         res = requests.get(url, params=params, timeout=15).json()
@@ -143,43 +111,11 @@ def get_historical_data(outputsize=4500) -> pd.DataFrame | None:
 
         df = pd.DataFrame(res["values"])
         df["datetime"] = pd.to_datetime(df["datetime"])
-
-        df.rename(columns={
-            "open": "Open",
-            "high": "High",
-            "low": "Low",
-            "close": "Close"
-        }, inplace=True)
-
-        price_columns = ["Open", "High", "Low", "Close"]
-        df[price_columns] = df[price_columns].astype(float)
-
+        df.rename(columns={"open": "Open", "high": "High", "low": "Low", "close": "Close"}, inplace=True)
+        df[["Open", "High", "Low", "Close"]] = df[["Open", "High", "Low", "Close"]].astype(float)
         df = df.sort_values("datetime").reset_index(drop=True)
         df = add_indicators(df)
-
-        df["TimeOfDay"] = df["datetime"].dt.strftime("%H:%M")
-
-        # Candle Result (Target for win rate)
-        df["Result_CALL"] = (df["Close"] > df["Open"]).astype(int)
-        df["Result_PUT"] = (df["Close"] < df["Open"]).astype(int)
-
-        # EMA Trend Consistency
-        df["EMA_Trend_CALL"] = (df["EMA50"] > df["EMA200"]).astype(int)
-        df["EMA_Trend_PUT"] = (df["EMA50"] < df["EMA200"]).astype(int)
-
-        # RSI Continuation
-        df["RSI_Cont_CALL"] = (df["RSI"] > 50).astype(int)
-        df["RSI_Cont_PUT"] = (df["RSI"] < 50).astype(int)
-
-        # Candle Strength
-        df["Body"] = (df["Close"] - df["Open"]).abs()
-        df["Range"] = (df["High"] - df["Low"]).replace(0, 0.00001)
-        df["Strength"] = df["Body"] / df["Range"]
-
-        # Momentum Continuation
-        df["Mom_Cont_CALL"] = (df["Close"] > df.shift(1)["Close"]).astype(int)
-        df["Mom_Cont_PUT"] = (df["Close"] < df.shift(1)["Close"]).astype(int)
-
+        df = _enrich_df(df)
         _save_df_cache(df)
         return df
 
@@ -187,34 +123,52 @@ def get_historical_data(outputsize=4500) -> pd.DataFrame | None:
         logger.error(f"Fetch Error: {e}")
         cached = _load_df_cache()
         if cached is not None:
-            logger.info("Using cached DataFrame due to fetch error.")
+            logger.info("Using cached DataFrame.")
         return cached
 
 
-# ──────────────────────────────────────────────────────────────
-# Live direction decision
-# ──────────────────────────────────────────────────────────────
+def _enrich_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Add all derived columns needed by the pattern engine."""
+    df["TimeOfDay"] = df["datetime"].dt.strftime("%H:%M")
 
+    # Candle result
+    df["Result_CALL"] = (df["Close"] > df["Open"]).astype(int)
+    df["Result_PUT"]  = (df["Close"] < df["Open"]).astype(int)
+
+    # EMA trend alignment
+    df["EMA_Trend_CALL"] = (df["EMA50"] > df["EMA200"]).astype(int)
+    df["EMA_Trend_PUT"]  = (df["EMA50"] < df["EMA200"]).astype(int)
+
+    # RSI continuation
+    df["RSI_Cont_CALL"] = (df["RSI"] > 50).astype(int)
+    df["RSI_Cont_PUT"]  = (df["RSI"] < 50).astype(int)
+
+    # Candle body / strength
+    df["Body"]     = (df["Close"] - df["Open"]).abs()
+    df["Range"]    = (df["High"] - df["Low"]).replace(0, 0.00001)
+    df["Strength"] = df["Body"] / df["Range"]
+
+    # Momentum continuation (close vs previous close)
+    df["Mom_Cont_CALL"] = (df["Close"] > df.shift(1)["Close"]).astype(int)
+    df["Mom_Cont_PUT"]  = (df["Close"] < df.shift(1)["Close"]).astype(int)
+
+    # Reversal flag: candle closes opposite to previous
+    df["Reversal"] = ((df["Result_CALL"] != df.shift(1)["Result_CALL"]) & df.shift(1)["Result_CALL"].notna()).astype(int)
+
+    return df
+
+
+# ── Live direction decision ───────────────────────────────
 def decide_direction_live(df: pd.DataFrame) -> tuple[str, int]:
-    """
-    Dynamically decide CALL or PUT using the latest candle data.
-    Uses EMA trend, RSI momentum, ATR strength, and candle momentum.
-
-    Returns (direction, confidence) where confidence is 0-100.
-    Never returns a hardcoded direction – always calculated from live data.
-    """
     if df is None or len(df) < 50:
-        # Absolute fallback – market data unavailable; default to None
         logger.warning("Insufficient data for live direction decision.")
         return None, 0
 
     last = df.iloc[-1]
     prev = df.iloc[-2] if len(df) >= 2 else last
+    call_score = put_score = 0
 
-    call_score = 0
-    put_score = 0
-
-    # --- 1. EMA Trend (weight: 25) ---
+    # EMA Trend (25)
     try:
         if not pd.isna(last["EMA50"]) and not pd.isna(last["EMA200"]):
             if last["EMA50"] > last["EMA200"]:
@@ -224,7 +178,7 @@ def decide_direction_live(df: pd.DataFrame) -> tuple[str, int]:
     except Exception:
         pass
 
-    # --- 2. RSI Momentum (weight: 25) ---
+    # RSI Momentum (25)
     try:
         rsi = float(last["RSI"]) if not pd.isna(last["RSI"]) else 50.0
         rsi_prev = float(prev["RSI"]) if not pd.isna(prev["RSI"]) else 50.0
@@ -239,12 +193,11 @@ def decide_direction_live(df: pd.DataFrame) -> tuple[str, int]:
     except Exception:
         pass
 
-    # --- 3. ATR Strength – bonus for active market (weight: 15) ---
+    # ATR Strength (15)
     try:
         atr = float(last["ATR"]) if not pd.isna(last["ATR"]) else 0
         atr_mean = float(df["ATR"].mean()) if not pd.isna(df["ATR"].mean()) else 0
         if atr > atr_mean:
-            # ATR boost goes to whatever side is winning
             if call_score >= put_score:
                 call_score += 15
             else:
@@ -252,7 +205,7 @@ def decide_direction_live(df: pd.DataFrame) -> tuple[str, int]:
     except Exception:
         pass
 
-    # --- 4. Latest candle momentum (weight: 15) ---
+    # Candle Momentum (15)
     try:
         close = float(last["Close"])
         open_ = float(last["Open"])
@@ -268,7 +221,7 @@ def decide_direction_live(df: pd.DataFrame) -> tuple[str, int]:
     except Exception:
         pass
 
-    # --- 5. Price relative to EMA50 (weight: 10) ---
+    # Price vs EMA50 (10)
     try:
         ema50 = float(last["EMA50"]) if not pd.isna(last["EMA50"]) else float(last["Close"])
         if float(last["Close"]) > ema50:
@@ -278,15 +231,13 @@ def decide_direction_live(df: pd.DataFrame) -> tuple[str, int]:
     except Exception:
         pass
 
-    total_possible = 100
     if call_score > put_score:
         direction = "CALL"
-        confidence = int((call_score / total_possible) * 100)
+        confidence = int((call_score / 100) * 100)
     elif put_score > call_score:
         direction = "PUT"
-        confidence = int((put_score / total_possible) * 100)
+        confidence = int((put_score / 100) * 100)
     else:
-        # Tie or 0-0 failure
         direction = None
         confidence = 0
 
@@ -294,203 +245,293 @@ def decide_direction_live(df: pd.DataFrame) -> tuple[str, int]:
     if direction:
         logger.info(f"Live direction: {direction} | CALL={call_score} PUT={put_score} | Confidence={confidence}%")
     else:
-        logger.warning(f"No clear direction found: CALL={call_score} PUT={put_score}")
-    
+        logger.warning(f"No clear direction: CALL={call_score} PUT={put_score}")
+
     return direction, confidence
 
 
-# ──────────────────────────────────────────────────────────────
-# Signal generation helpers
-# ──────────────────────────────────────────────────────────────
+# ── Advanced recurring pattern analysis ──────────────────
+def _analyse_slot(slot_data: pd.DataFrame, atr_mean: float, direction: str) -> dict:
+    """
+    Compute all 8 metrics for a single time-slot + direction.
 
-def calculate_recurring_strength(df):
-    """Analyze recurring timing strength across historical data."""
+    Returns a dict with named metrics and a composite score (0-100).
+    """
+    n = len(slot_data)
+    if direction == "CALL":
+        wr          = slot_data["Result_CALL"].mean() * 100        # historical success %
+        ema_align   = slot_data["EMA_Trend_CALL"].mean() * 100
+        rsi_cont    = slot_data["RSI_Cont_CALL"].mean() * 100
+        mom_cont    = slot_data["Mom_Cont_CALL"].mean() * 100
+    else:
+        wr          = slot_data["Result_PUT"].mean() * 100
+        ema_align   = slot_data["EMA_Trend_PUT"].mean() * 100
+        rsi_cont    = slot_data["RSI_Cont_PUT"].mean() * 100
+        mom_cont    = slot_data["Mom_Cont_PUT"].mean() * 100
+
+    # ATR stability: how close is slot ATR to the mean (low spread = stable)
+    atr_avg       = slot_data["ATR"].mean()
+    atr_stability = 100 if atr_avg > atr_mean * 0.6 else 60  # active but not extreme
+
+    # Bullish / Bearish consistency
+    bullish_pct   = slot_data["Result_CALL"].mean() * 100
+    bearish_pct   = slot_data["Result_PUT"].mean() * 100
+
+    # Reversal frequency (low = better)
+    reversal_freq = slot_data["Reversal"].mean() * 100 if "Reversal" in slot_data.columns else 50.0
+    reversal_score = max(0, 100 - reversal_freq)          # invert: low reversals → high score
+
+    # Average candle continuation strength
+    candle_strength = slot_data["Strength"].mean() * 100
+
+    # Session strength: weight London (13-18 IST) higher
+    # (will be applied in caller after UTC→IST conversion)
+    session_strength = 100.0  # placeholder; refined by caller
+
+    # Composite score with weights
+    composite = (
+        wr            * 0.30 +   # historical direction success
+        ema_align     * 0.15 +   # EMA trend alignment
+        rsi_cont      * 0.10 +   # RSI momentum continuation
+        atr_stability * 0.10 +   # ATR stability / activity
+        mom_cont      * 0.10 +   # candle momentum continuation
+        reversal_score* 0.10 +   # low reversal probability
+        candle_strength*0.10 +   # candle body strength
+        session_strength*0.05    # session weighting (5% placeholder)
+    )
+
+    return {
+        "direction": direction,
+        "n": n,
+        "historical_success_rate": round(wr, 1),
+        "bullish_pct": round(bullish_pct, 1),
+        "bearish_pct": round(bearish_pct, 1),
+        "ema_alignment": round(ema_align, 1),
+        "rsi_continuation": round(rsi_cont, 1),
+        "atr_avg": round(atr_avg, 6),
+        "atr_stability": atr_stability,
+        "momentum_consistency": round(mom_cont, 1),
+        "reversal_frequency": round(reversal_freq, 1),
+        "candle_strength": round(candle_strength, 1),
+        "composite": round(composite, 2),
+    }
+
+
+def calculate_recurring_strength(df: pd.DataFrame) -> list[dict]:
+    """
+    Main pattern analysis.  Scans every 5-min time slot over the last
+    14 days and selects the strongest recurring directional patterns.
+
+    Returns a list of signal dicts (sorted by time) ready for
+    generated_signals.json, each including:
+        time, pair, direction, confidence, pattern_strength,
+        historical_success_rate, source="generated"
+    """
     if df is None or len(df) < 500:
+        logger.warning("Insufficient data for recurring pattern analysis.")
         return []
 
-    atr_mean = df["ATR"].mean()
-    unique_times = df["TimeOfDay"].unique()
-    call_candidates = []
-    put_candidates = []
+    # Restrict to last 14 days
+    cutoff = df["datetime"].max() - timedelta(days=14)
+    df = df[df["datetime"] >= cutoff].copy()
 
-    for t in unique_times:
-        slot_data = df[df["TimeOfDay"] == t]
-        if len(slot_data) < 7:
+    atr_mean = df["ATR"].mean()
+    unique_times = sorted(df["TimeOfDay"].unique())
+
+    call_candidates: list[dict] = []
+    put_candidates:  list[dict] = []
+
+    for t_utc in unique_times:
+        slot_data = df[df["TimeOfDay"] == t_utc]
+        if len(slot_data) < MIN_SLOT_OCCURRENCES:
             continue
 
-        wr_call = slot_data["Result_CALL"].mean() * 100
-        wr_put = slot_data["Result_PUT"].mean() * 100
-        ema_call = slot_data["EMA_Trend_CALL"].mean() * 100
-        ema_put = slot_data["EMA_Trend_PUT"].mean() * 100
-        rsi_call = slot_data["RSI_Cont_CALL"].mean() * 100
-        rsi_put = slot_data["RSI_Cont_PUT"].mean() * 100
-        atr_avg = slot_data["ATR"].mean()
-        atr_score = 100 if atr_avg > atr_mean else 60
-        rsi_avg = slot_data["RSI"].mean()
-        mom_call = slot_data["Mom_Cont_CALL"].mean() * 100
-        mom_put = slot_data["Mom_Cont_PUT"].mean() * 100
-        str_avg = slot_data["Strength"].mean() * 100
+        # Convert UTC time → IST (+5:30)
+        try:
+            h, m = map(int, t_utc.split(":"))
+        except ValueError:
+            continue
+        ist_minutes = (h * 60 + m + 330) % 1440
 
-        conf_call = (wr_call * 0.35) + (ema_call * 0.20) + (rsi_call * 0.15) + (atr_score * 0.10) + (mom_call * 0.10) + (str_avg * 0.10)
-        conf_put = (wr_put * 0.35) + (ema_put * 0.20) + (rsi_put * 0.15) + (atr_score * 0.10) + (mom_put * 0.10) + (str_avg * 0.10)
-
-        adj_call = learning_engine.get_adaptive_adjustment(t, "CALL", int(conf_call), atr_avg, rsi_avg, source="generated")
-        adj_put = learning_engine.get_adaptive_adjustment(t, "PUT", int(conf_put), atr_avg, rsi_avg, source="generated")
-
-        if adj_call <= -3:
-            conf_call = 0
-        else:
-            conf_call += adj_call
-
-        if adj_put <= -3:
-            conf_put = 0
-        else:
-            conf_put += adj_put
-
-        h, m = map(int, t.split(':'))
-        utc_minutes = h * 60 + m
-        ist_minutes = (utc_minutes + 330) % 1440
-
+        # Only generate for 13:00 – 22:00 IST session
         if not (13 * 60 <= ist_minutes <= 22 * 60):
             continue
 
         ist_time_str = f"{ist_minutes // 60:02d}:{ist_minutes % 60:02d}"
 
-        if conf_call >= 70:
-            call_candidates.append({
-                "time": ist_time_str,
-                "pair": PAIR,
-                "direction": "CALL",
-                "confidence": int(conf_call)
-            })
+        # Session strength weight (London/NY prime = 13:30–21:30 IST)
+        london_start = 13 * 60 + 30
+        ny_close     = 21 * 60 + 30
+        session_str  = 100.0 if london_start <= ist_minutes <= ny_close else 75.0
 
-        if conf_put >= 70:
-            put_candidates.append({
+        for direction in ("CALL", "PUT"):
+            metrics = _analyse_slot(slot_data, atr_mean, direction)
+            metrics["composite"] += (session_str - 100.0) * 0.05  # adjust for session
+            metrics["session_strength"] = session_str
+
+            base_conf = metrics["composite"]
+
+            # Skip obviously weak slots early
+            if base_conf < BASE_CONFIDENCE_THRESHOLD - 10:
+                continue
+
+            # Get legacy learning engine adjustment
+            rsi_avg = float(slot_data["RSI"].mean()) if "RSI" in slot_data.columns else 50.0
+            adj_legacy = learning_engine.get_adaptive_adjustment(
+                ist_time_str, direction, int(base_conf),
+                metrics["atr_avg"], rsi_avg, source="generated"
+            )
+            if adj_legacy <= -3:
+                continue   # learning engine veto
+            base_conf += adj_legacy
+
+            # Get timing_db adaptive adjustment
+            adj_timing = timing_db.get_adaptive_adjustment(ist_time_str, direction)
+            base_conf += adj_timing
+
+            # Pattern strength from timing_db
+            pattern_strength = timing_db.get_pattern_strength(ist_time_str, direction)
+
+            # Reject if pattern strength too low AND confidence borderline
+            if pattern_strength < PATTERN_STRENGTH_THRESHOLD and base_conf < BASE_CONFIDENCE_THRESHOLD:
+                continue
+
+            if base_conf < BASE_CONFIDENCE_THRESHOLD:
+                continue
+
+            signal = {
                 "time": ist_time_str,
                 "pair": PAIR,
-                "direction": "PUT",
-                "confidence": int(conf_put)
-            })
+                "direction": direction,
+                "confidence": int(min(99, base_conf)),
+                "pattern_strength": pattern_strength,
+                "historical_success_rate": metrics["historical_success_rate"],
+                "source": "generated",
+                # Extra context (for logging / stats)
+                "_metrics": metrics,
+            }
+
+            if direction == "CALL":
+                call_candidates.append(signal)
+            else:
+                put_candidates.append(signal)
 
     call_candidates.sort(key=lambda x: x["confidence"], reverse=True)
     put_candidates.sort(key=lambda x: x["confidence"], reverse=True)
 
+    # ── Balanced selection ────────────────────────────────
+    final = _select_balanced(call_candidates, put_candidates)
+
+    # Strip internal metrics key
+    for s in final:
+        s.pop("_metrics", None)
+
+    final.sort(key=lambda x: x["time"])
+
+    # Log summary
+    for s in final:
+        logger.info(
+            f"[Pattern] {s['time']} {s['direction']} | "
+            f"Confidence={s['confidence']}% | "
+            f"Pattern Strength={s['pattern_strength']} | "
+            f"Historical Success={s['historical_success_rate']}%"
+        )
+
+    return final
+
+
+def _select_balanced(
+    call_candidates: list[dict],
+    put_candidates:  list[dict],
+    total_target: int = 12,
+    max_dominance: float = 0.70,
+    balance_min_conf: int = 63,
+) -> list[dict]:
+    """Select up to total_target signals keeping direction balance ≤ max_dominance."""
     combined = call_candidates + put_candidates
     combined.sort(key=lambda x: x["confidence"], reverse=True)
 
-    total_target = 12
-    max_dominance = 0.70
-    # Minimum confidence required for opposite-direction balancing signals
-    BALANCE_MIN_CONFIDENCE = 65
+    final: list[dict] = []
+    c_count = p_count = 0
+    avail_c = len(call_candidates)
+    avail_p = len(put_candidates)
 
-    final_signals = []
-    c_count = 0
-    p_count = 0
-
-    available_c = len(call_candidates)
-    available_p = len(put_candidates)
-
-    # ── Pass 1: standard selection at ≥70 confidence ─────────────────────────
+    # Pass 1: standard selection
     for s in combined:
-        if len(final_signals) >= total_target:
+        if len(final) >= total_target:
             break
-
         if s["direction"] == "CALL":
-            max_possible_p = min(available_p, total_target - (c_count + 1))
-            # Allow at least 2 signals to avoid empty outputs on low-volatility days
-            max_allowed = max(2, (c_count + 1 + max_possible_p) * max_dominance)
+            max_p = min(avail_p, total_target - (c_count + 1))
+            max_allowed = max(2, (c_count + 1 + max_p) * max_dominance)
             if (c_count + 1) > max_allowed:
                 continue
-            final_signals.append(s)
+            final.append(s)
             c_count += 1
         else:
-            max_possible_c = min(available_c, total_target - (p_count + 1))
-            max_allowed = max(2, (p_count + 1 + max_possible_c) * max_dominance)
+            max_c = min(avail_c, total_target - (p_count + 1))
+            max_allowed = max(2, (p_count + 1 + max_c) * max_dominance)
             if (p_count + 1) > max_allowed:
                 continue
-            final_signals.append(s)
+            final.append(s)
             p_count += 1
 
-    # ── Pass 2: rebalancing – soften dominance using ≥65-confidence opposites ─
-    # Only triggers when one direction exceeds the 70% cap after Pass 1.
-    total_selected = len(final_signals)
+    # Pass 2: rebalance if one direction dominates
+    total_selected = len(final)
     if total_selected >= 2:
-        dominant = "CALL" if c_count > p_count else "PUT"
-        minority = "PUT" if dominant == "CALL" else "CALL"
-        dominant_count = c_count if dominant == "CALL" else p_count
-        minority_count = p_count if dominant == "CALL" else c_count
+        dominant  = "CALL" if c_count > p_count else "PUT"
+        minority  = "PUT"  if dominant == "CALL" else "CALL"
+        dom_count = c_count if dominant == "CALL" else p_count
 
-        dominance_ratio = dominant_count / total_selected if total_selected > 0 else 0
-
-        if dominance_ratio > max_dominance:
-            # Collect minority candidates that meet the lower threshold but were
-            # excluded from Pass 1 (conf < 70 or simply not yet included).
-            selected_times = {s["time"] for s in final_signals}
+        if dom_count / total_selected > max_dominance:
+            selected_times = {s["time"] for s in final}
             minority_pool = [
                 s for s in (put_candidates if minority == "PUT" else call_candidates)
-                if s["confidence"] >= BALANCE_MIN_CONFIDENCE
-                and s["time"] not in selected_times
+                if s["confidence"] >= balance_min_conf and s["time"] not in selected_times
             ]
             minority_pool.sort(key=lambda x: x["confidence"], reverse=True)
 
-            # How many swaps do we need to bring dominance to ≤70%?
-            # dominance_ratio_after = (dominant_count - swaps) / total_selected
-            # We want (dominant_count - swaps) / total_selected ≤ max_dominance
-            max_dominant_allowed = int(total_selected * max_dominance)
-            swaps_needed = dominant_count - max_dominant_allowed
+            max_dom_allowed  = int(total_selected * max_dominance)
+            swaps_needed     = dom_count - max_dom_allowed
 
             for extra in minority_pool:
                 if swaps_needed <= 0:
                     break
-                # Remove the weakest dominant-direction signal to make room
-                dominant_signals = [
-                    s for s in final_signals if s["direction"] == dominant
-                ]
-                if not dominant_signals:
+                dom_sigs = [s for s in final if s["direction"] == dominant]
+                if not dom_sigs:
                     break
-                weakest = min(dominant_signals, key=lambda x: x["confidence"])
+                weakest = min(dom_sigs, key=lambda x: x["confidence"])
                 if weakest["confidence"] > extra["confidence"]:
-                    # The weakest dominant signal is still stronger; stop swapping
-                    logger.info(
-                        f"[Balance] Stopping swap: weakest {dominant} conf={weakest['confidence']}% "
-                        f"> opposite {extra['confidence']}%"
-                    )
                     break
-                final_signals.remove(weakest)
-                final_signals.append(extra)
+                final.remove(weakest)
+                final.append(extra)
                 if dominant == "CALL":
-                    c_count -= 1
-                    p_count += 1
+                    c_count -= 1; p_count += 1
                 else:
-                    p_count -= 1
-                    c_count += 1
+                    p_count -= 1; c_count += 1
                 swaps_needed -= 1
                 logger.info(
-                    f"[Balance] Swapped out {dominant} conf={weakest['confidence']}% "
-                    f"for {minority} conf={extra['confidence']}% at {extra['time']}"
+                    f"[Balance] Swapped {dominant} conf={weakest['confidence']}% "
+                    f"→ {minority} conf={extra['confidence']}% @ {extra['time']}"
                 )
 
-    final_signals.sort(key=lambda x: x["time"])
-    return final_signals
+    return final
 
 
-def has_run_today():
-    """Check if the generator already ran today."""
+# ── State helpers ─────────────────────────────────────────
+def has_run_today() -> bool:
     try:
         state = safe_load_json(STATE_FILE, default={})
-        last_run = state.get("last_run_date")
-        return last_run == datetime.now().strftime("%Y-%m-%d")
+        return state.get("last_run_date") == datetime.now().strftime("%Y-%m-%d")
     except Exception:
         return False
 
 
-def update_run_state():
-    """Update the state file with today's date."""
+def update_run_state() -> None:
     safe_save_json(STATE_FILE, {"last_run_date": datetime.now().strftime("%Y-%m-%d")})
 
 
-def generate_daily_signals():
-    """Main execution function to generate signals once daily."""
+# ── Main daily generation ─────────────────────────────────
+def generate_daily_signals() -> bool:
     if has_run_today():
         logger.info("Signals already generated for today. Skipping.")
         return False
@@ -502,74 +543,43 @@ def generate_daily_signals():
         logger.error("Failed to fetch data.")
         return False
 
-    # Guard: reject stale fallback data so we never generate signals from
-    # candles that are more than 30 minutes old.
     if not is_df_cache_fresh():
-        logger.warning(
-            "Cached market data too old — skipping daily signal generation "
-            "until fresh data is available."
-        )
+        logger.warning("Cached market data too old — skipping generation.")
         return False
 
     signals = calculate_recurring_strength(df)
 
     if signals:
         safe_save_json(SIGNAL_FILE, signals)
-        logger.info(f"Successfully generated {len(signals)} strong signals.")
+        logger.info(f"Generated {len(signals)} strong recurring signals.")
         update_run_state()
         return True
     else:
-        logger.info("No signals met the confidence threshold today.")
+        logger.info("No signals met the pattern threshold today.")
         return False
 
 
-# ──────────────────────────────────────────────────────────────
-# FORCED DAILY SIGNALS  (15:05 direct + 15:10 martingale)
-# ──────────────────────────────────────────────────────────────
-
+# ── Forced daily signals (15:05 + 15:10) ─────────────────
 def generate_forced_daily_signals(df: pd.DataFrame | None = None) -> list[dict]:
-    """
-    ALWAYS generate two compulsory signals every day:
-      • 15:05 IST  – direct / main signal
-      • 15:10 IST  – martingale follow-up
-
-    Direction is NEVER hardcoded. It is decided dynamically using the
-    latest candle's EMA trend, RSI momentum, ATR strength, and candle
-    momentum from the supplied (or freshly fetched) DataFrame.
-
-    If the DataFrame is unavailable, falls back to the disk cache.
-
-    Signals are written into generated_signals.json (merged with existing
-    signals, deduplicating by time).
-
-    Returns the two forced signal dicts.
-    """
     logger.info("--- Generating FORCED daily signals (15:05 + 15:10) ---")
 
-    # 1. Ensure we have a DataFrame
     if df is None or len(df) < 50:
         df = _load_df_cache()
     if df is None or len(df) < 50:
-        df = get_historical_data(outputsize=500)  # lightweight fetch
+        df = get_historical_data(outputsize=500)
     if df is None or len(df) < 50:
-        logger.warning("No market data available for forced signals; using minimal default.")
-        df = None  # decide_direction_live handles None gracefully
+        df = None
 
-    # 2. Calculate live direction
     direction, confidence = decide_direction_live(df)
-    
+
     if direction is None:
-        logger.warning("Skipping forced signal generation due to missing live direction (API/data failure).")
+        logger.warning("Skipping forced signals — no live direction (data unavailable).")
         return []
 
     low_confidence = confidence < FORCE_SIGNAL_CONFIDENCE_THRESHOLD
-
     if low_confidence:
-        logger.warning(
-            f"Forced signal confidence LOW ({confidence}%) — will tag as LOW CONFIDENCE / RISKY MARKET"
-        )
+        logger.warning(f"Forced signal LOW confidence ({confidence}%) — tagging as RISKY")
 
-    # 3. Build the two forced signal dicts
     direct_signal = {
         "time": FORCE_DIRECT_TIME,
         "pair": PAIR,
@@ -579,7 +589,6 @@ def generate_forced_daily_signals(df: pd.DataFrame | None = None) -> list[dict]:
         "signal_type": "direct",
         "low_confidence": low_confidence,
     }
-
     martingale_signal = {
         "time": FORCE_MARTINGALE_TIME,
         "pair": PAIR,
@@ -589,41 +598,34 @@ def generate_forced_daily_signals(df: pd.DataFrame | None = None) -> list[dict]:
         "signal_type": "martingale",
         "low_confidence": low_confidence,
     }
-
     forced_signals = [direct_signal, martingale_signal]
 
-    # 4. Merge with existing signals in generated_signals.json
     existing = safe_load_json(SIGNAL_FILE, default=[])
     if not isinstance(existing, list):
         existing = []
 
-    # Remove any previous forced signals at the same times so we always
-    # regenerate them fresh (never skip due to stale cache)
     forced_times = {FORCE_DIRECT_TIME, FORCE_MARTINGALE_TIME}
     existing = [s for s in existing if s.get("time") not in forced_times]
 
-    # 5. Filter by session (13:00 - 22:00 IST)
     all_signals = existing + forced_signals
     filtered = []
     for s in all_signals:
         t_str = s.get("time")
-        if not t_str: continue
+        if not t_str:
+            continue
         try:
             h, m = map(int, t_str.split(":"))
-            total_m = h * 60 + m
-            if 13 * 60 <= total_m <= 22 * 60:
+            if 13 * 60 <= h * 60 + m <= 22 * 60:
                 filtered.append(s)
         except Exception:
             continue
 
-    merged = filtered
-    merged.sort(key=lambda x: x.get("time", ""))
-
+    filtered.sort(key=lambda x: x.get("time", ""))
     try:
-        safe_save_json(SIGNAL_FILE, merged)
+        safe_save_json(SIGNAL_FILE, filtered)
         logger.info(
-            f"Forced signals saved: {direction} @ {FORCE_DIRECT_TIME} (direct) "
-            f"& {FORCE_MARTINGALE_TIME} (martingale) | confidence={confidence}%"
+            f"Forced signals saved: {direction} @ {FORCE_DIRECT_TIME} & "
+            f"{FORCE_MARTINGALE_TIME} | confidence={confidence}%"
         )
     except Exception as e:
         logger.error(f"Could not save forced signals: {e}")
